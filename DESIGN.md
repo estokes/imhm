@@ -128,7 +128,8 @@ remove, take_items}` and `RawMut`.
   count update that records it.
 
 `lib.rs` has one more `unsafe` block: the SSE2 tag compare. The tests
-include threads sharing, changing and dropping clones of one map.
+include threads sharing, changing and dropping clones of one map. The
+whole suite passes under Miri.
 
 ## Performance
 

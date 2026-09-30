@@ -302,7 +302,7 @@ fn drops_balance() {
 fn model_deep() {
     let depths: Vec<u8> = (0..scale(20) as u64)
         .map(|seed| {
-            let m = model_test(Placed::<0>, seed, scale(5_000), placed_key::<0>);
+            let m = model_test(Placed::<0>, seed, 5_000, placed_key::<0>);
             depth_of(m.root.as_ref().unwrap())
         })
         .collect();
@@ -313,7 +313,7 @@ fn model_deep() {
 fn model_collisions() {
     let depths: Vec<u8> = (0..scale(20) as u64)
         .map(|seed| {
-            let m = model_test(Placed::<2>, seed, scale(5_000), placed_key::<2>);
+            let m = model_test(Placed::<2>, seed, 5_000, placed_key::<2>);
             depth_of(m.root.as_ref().unwrap())
         })
         .collect();
