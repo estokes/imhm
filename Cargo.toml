@@ -4,3 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1"
+rustc-hash = "2"
+triomphe = "0.1.16"
+
+[dev-dependencies]
+arcstr = "1"
+compact_str = "0.9"
+imbl = "7"
+immutable-chunkmap = { version = "2.1.4", features = ["pool"] }
