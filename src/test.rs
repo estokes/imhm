@@ -108,19 +108,21 @@ fn check_node<K: Hash + Eq, V, S: BuildHasher>(s: &S, n: &Node<K, V>) -> usize {
             es.len()
         }
         Node::Inner(inner) => {
-            let (h, slots) = (inner.header(), inner.items());
+            let h = inner.header();
             assert!(d <= MAX_DEPTH);
-            assert_eq!(slots.len(), h.bitmap.count_ones() as usize);
-            assert!(!matches!(slots, [Slot::Node(Node::Leaf(_))]));
-            let p = prefix(slots[0].hash(), d);
-            let mut bits = h.bitmap;
+            assert!(!lone_leaf(inner));
+            let p = prefix(Node::Inner(inner.clone()).hash(), d);
             let mut len = 0;
-            for slot in slots {
+            for (f, slot) in slots(inner).iter().enumerate() {
+                assert_eq!(h.bitmap & 1 << f != 0, !matches!(slot, Slot::Empty));
+                if let Slot::Empty = slot {
+                    continue;
+                }
                 let hash = slot.hash();
                 assert_eq!(prefix(hash, d), p);
-                assert_eq!(bit(hash, d), 1 << bits.trailing_zeros());
-                bits &= bits - 1;
+                assert_eq!(frag(hash, d), f);
                 len += match slot {
+                    Slot::Empty => 0,
                     Slot::Entry(e) => {
                         assert_eq!(e.hash, hash_of(s, &e.key));
                         1
@@ -141,12 +143,11 @@ fn check_node<K: Hash + Eq, V, S: BuildHasher>(s: &S, n: &Node<K, V>) -> usize {
 fn depth_of<K, V>(n: &Node<K, V>) -> u8 {
     match n {
         Node::Leaf(l) => l.header().depth,
-        Node::Inner(inner) => inner
-            .items()
+        Node::Inner(inner) => slots(inner)
             .iter()
             .map(|s| match s {
                 Slot::Node(c) => depth_of(c),
-                Slot::Entry(_) => inner.header().depth,
+                Slot::Empty | Slot::Entry(_) => inner.header().depth,
             })
             .max()
             .unwrap_or(inner.header().depth),
@@ -442,7 +443,7 @@ fn update_copies_one_path() {
         if ids.insert(n.addr())
             && let Node::Inner(inner) = n
         {
-            for s in inner.items() {
+            for s in slots(inner) {
                 if let Slot::Node(c) = s {
                     nodes(c, ids)
                 }

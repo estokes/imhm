@@ -136,36 +136,6 @@ impl<H, T> Raw<H, T> {
         RawMut(self)
     }
 
-    /// Adds `item` at `i`.
-    pub(crate) fn insert(&mut self, i: usize, item: T)
-    where
-        H: Clone,
-        T: Clone,
-    {
-        if self.is_unique() {
-            return RawMut(self).insert(i, item);
-        }
-        let (l, r) = self.items().split_at(i);
-        let items = l.iter().cloned().chain([item]).chain(r.iter().cloned());
-        *self = Self::new(self.header().clone(), self.count() + 1, items);
-    }
-
-    /// Removes the item at `i`.
-    pub(crate) fn remove(&mut self, i: usize) -> T
-    where
-        H: Clone,
-        T: Clone,
-    {
-        if self.is_unique() {
-            return RawMut(self).remove(i);
-        }
-        let s = self.items();
-        let removed = s[i].clone();
-        let items = s[..i].iter().chain(&s[i + 1..]).cloned();
-        *self = Self::new(self.header().clone(), self.count() - 1, items);
-        removed
-    }
-
     /// Adds `item` after the others.
     pub(crate) fn push(&mut self, item: T)
     where
@@ -292,23 +262,6 @@ impl<'a, H, T> RawMut<'a, H, T> {
         }
     }
 
-    /// Adds `item` at `i`, the items from `i` moving up one.
-    pub(crate) fn insert(&mut self, i: usize, item: T) {
-        let count = self.0.count();
-        assert!(i <= count);
-        if count == self.0.cap() {
-            self.grow()
-        }
-        // SAFETY: the node is ours alone and has room: the items from `i`
-        // shift up one, and writing the freed slot makes one more item.
-        unsafe {
-            let base = self.0.base();
-            ptr::copy(base.add(i), base.add(i + 1), count - i);
-            base.add(i).write(item);
-            self.0.ptr.as_mut().count += 1;
-        }
-    }
-
     /// Adds `item` after the others.
     pub(crate) fn push(&mut self, item: T) {
         let count = self.0.count();
@@ -335,21 +288,6 @@ impl<'a, H, T> RawMut<'a, H, T> {
             if i != count - 1 {
                 ptr::copy_nonoverlapping(base.add(count - 1), base.add(i), 1);
             }
-            self.0.ptr.as_mut().count -= 1;
-            item
-        }
-    }
-
-    /// Removes the item at `i`.
-    pub(crate) fn remove(&mut self, i: usize) -> T {
-        let count = self.0.count();
-        assert!(i < count);
-        // SAFETY: the node is ours alone. Item `i` is read out and the
-        // items after it shift down over it as the count drops.
-        unsafe {
-            let base = self.0.base();
-            let item = base.add(i).read();
-            ptr::copy(base.add(i + 1), base.add(i), count - i - 1);
             self.0.ptr.as_mut().count -= 1;
             item
         }

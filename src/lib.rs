@@ -51,16 +51,11 @@ fn hash_of<Q: Hash + ?Sized>(s: &impl BuildHasher, q: &Q) -> u64 {
     mix(s.hash_one(q))
 }
 
-/// The bit of `hash`'s fragment at `depth`, high bits first, so a
-/// trie's order is its hashes' order.
+/// `hash`'s fragment at `depth`, high bits first, so a trie's order is
+/// its hashes' order.
 #[inline]
-fn bit(hash: u64, depth: u8) -> u32 {
-    1 << ((hash << (BITS * depth as u32)) >> 59)
-}
-
-#[inline]
-fn index(bitmap: u32, bit: u32) -> usize {
-    (bitmap & (bit - 1)).count_ones() as usize
+fn frag(hash: u64, depth: u8) -> usize {
+    ((hash << (BITS * depth as u32)) >> 59) as usize
 }
 
 /// The fragments above `depth`, which every hash under a node there
@@ -81,6 +76,7 @@ struct Entry<K, V> {
     val: V,
 }
 
+/// `bitmap` has the bits of the fragments whose slots are not empty.
 #[derive(Clone, Copy)]
 struct InnerHead {
     len: usize,
@@ -97,9 +93,13 @@ struct LeafHead {
     order: [u8; LEAF],
 }
 
-/// Slots are in fragment order, one per bit of `bitmap`. It holds more
-/// than [`LEAF`] pairs of at least two hashes.
+/// A slot per fragment, holding more than [`LEAF`] pairs of at least two
+/// hashes.
 type Inner<K, V> = Raw<InnerHead, Slot<K, V>>;
+
+fn slots<K, V>(n: &Inner<K, V>) -> &[Slot<K, V>; 32] {
+    n.items().try_into().expect("a slot per fragment")
+}
 
 /// At least two entries below the root, and at most [`LEAF`] unless all
 /// share one hash.
@@ -122,8 +122,13 @@ impl<K, V> Clone for Node<K, V> {
 /// A subtree of one pair is an entry in its parent's slot.
 #[derive(Clone)]
 enum Slot<K, V> {
+    Empty,
     Entry(Entry<K, V>),
     Node(Node<K, V>),
+}
+
+fn empty_slots<K, V>() -> [Slot<K, V>; 32] {
+    array::from_fn(|_| Slot::Empty)
 }
 
 impl<K, V> Node<K, V> {
@@ -145,7 +150,9 @@ impl<K, V> Node<K, V> {
     /// above its depth, so any one places it.
     fn hash(&self) -> u64 {
         match self {
-            Node::Inner(n) => n.items()[0].hash(),
+            Node::Inner(n) => {
+                slots(n)[n.header().bitmap.trailing_zeros() as usize].hash()
+            }
             Node::Leaf(n) => n.items()[0].hash,
         }
     }
@@ -167,8 +174,10 @@ impl<K, V> Node<K, V> {
 }
 
 impl<K, V> Slot<K, V> {
+    /// A hash from a slot not empty.
     fn hash(&self) -> u64 {
         match self {
+            Slot::Empty => unreachable!("an empty slot has no hash"),
             Slot::Entry(e) => e.hash,
             Slot::Node(n) => n.hash(),
         }
@@ -176,6 +185,7 @@ impl<K, V> Slot<K, V> {
 
     fn len(&self) -> usize {
         match self {
+            Slot::Empty => 0,
             Slot::Entry(_) => 1,
             Slot::Node(n) => n.len(),
         }
@@ -252,22 +262,21 @@ fn build<K, V>(
         let h = leaf_head(depth, s);
         return Node::Leaf(Raw::new(h, n, entries.by_ref().take(n)));
     }
+    let mut slots = empty_slots();
     let mut bitmap = 0;
-    let mut sizes = [0; 32];
-    let mut slots = 0;
-    for e in s {
-        let b = bit(e.hash, depth);
-        if bitmap & b == 0 {
-            bitmap |= b;
-            slots += 1;
-        }
-        sizes[slots - 1] += 1;
+    let mut left = n;
+    while left > 0 {
+        let s = &entries.as_slice()[..left];
+        let f = frag(s[0].hash, depth);
+        let k = s.iter().take_while(|e| frag(e.hash, depth) == f).count();
+        slots[f] = match k {
+            1 => Slot::Entry(entries.next().expect("a group's entry")),
+            k => Slot::Node(build(depth + 1, entries, k)),
+        };
+        bitmap |= 1 << f;
+        left -= k;
     }
-    let items = sizes[..slots].iter().map(|&k| match k {
-        1 => Slot::Entry(entries.next().expect("a group's entry")),
-        k => Slot::Node(build(depth + 1, entries, k)),
-    });
-    Node::Inner(Raw::new(InnerHead { len: n, bitmap, depth }, slots, items))
+    Node::Inner(Raw::new(InnerHead { len: n, bitmap, depth }, 32, slots))
 }
 
 /// Every entry under `node`, in hash order, moved out of the nodes no
@@ -278,6 +287,7 @@ fn drain_into<K: Clone, V: Clone>(node: &mut Node<K, V>, out: &mut Vec<Entry<K, 
         Node::Inner(n) => {
             for slot in n.take_items() {
                 match slot {
+                    Slot::Empty => (),
                     Slot::Entry(e) => out.push(e),
                     Slot::Node(mut c) => drain_into(&mut c, out),
                 }
@@ -290,13 +300,21 @@ fn drain_into<K: Clone, V: Clone>(node: &mut Node<K, V>, out: &mut Vec<Entry<K, 
 /// one leaf, a leaf.
 fn settle<K: Clone, V: Clone>(node: &mut Node<K, V>) {
     let Node::Inner(n) = node else { return };
-    if n.header().len > LEAF && !matches!(n.items(), [Slot::Node(Node::Leaf(_))]) {
+    let h = *n.header();
+    if h.len > LEAF && !lone_leaf(n) {
         return;
     }
-    let (depth, len) = (n.header().depth, n.header().len);
+    let (depth, len) = (h.depth, h.len);
     let mut entries = Vec::with_capacity(len);
     drain_into(node, &mut entries);
     *node = build(depth, &mut entries.drain(..), len);
+}
+
+/// Whether the node's only slot is a leaf, whose entries share one hash.
+fn lone_leaf<K, V>(n: &Inner<K, V>) -> bool {
+    let bitmap = n.header().bitmap;
+    bitmap.count_ones() == 1
+        && matches!(slots(n)[bitmap.trailing_zeros() as usize], Slot::Node(Node::Leaf(_)))
 }
 
 /// Whether comparing keys costs about as much as comparing hashes, so a
@@ -363,16 +381,10 @@ where
                 return Some((&e.key, &e.val));
             }
             Node::Inner(inner) => {
-                // `below` has the bits of fragments up to this one, which
-                // is bit 31.
-                let below = inner.header().bitmap << (!rest >> 59);
+                let f = (rest >> 59) as usize;
                 rest <<= BITS;
-                if (below as i32) >= 0 {
-                    return None;
-                }
-                let i = below.count_ones() as usize - 1;
-                // SAFETY: an inner node has a slot per bit of its bitmap.
-                match unsafe { inner.items().get_unchecked(i) } {
+                match &slots(inner)[f] {
+                    Slot::Empty => return None,
                     Slot::Entry(e) => {
                         return (e.hash == hash && e.key.borrow() == q)
                             .then_some((&e.key, &e.val));
@@ -392,38 +404,33 @@ fn insert<K: Eq + Clone, V: Clone>(
 ) -> Option<V> {
     match node {
         Node::Inner(inner) => {
-            let h = *inner.header();
-            let bit = bit(hash, h.depth);
-            let i = index(h.bitmap, bit);
-            if h.bitmap & bit == 0 {
-                inner.insert(i, Slot::Entry(Entry { hash, key, val }));
-                let mut m = inner.make_mut();
-                m.header().bitmap |= bit;
-                m.header().len += 1;
-                return None;
-            }
             let mut m = inner.make_mut();
             let (h, slots) = m.parts();
-            match &mut slots[i] {
+            let f = frag(hash, h.depth);
+            let slot = &mut slots[f];
+            let prev = match slot {
+                Slot::Empty => {
+                    *slot = Slot::Entry(Entry { hash, key, val });
+                    h.bitmap |= 1 << f;
+                    None
+                }
                 Slot::Entry(e) if e.hash == hash && e.key == key => {
                     return Some(mem::replace(&mut e.val, val));
                 }
-                Slot::Node(child) => {
-                    let prev = insert(child, hash, key, val);
-                    if prev.is_none() {
-                        h.len += 1
-                    }
-                    return prev;
+                Slot::Entry(_) => {
+                    let Slot::Entry(old) = mem::replace(slot, Slot::Empty) else {
+                        unreachable!("an entry, matched above")
+                    };
+                    let new = Entry { hash, key, val };
+                    *slot = Slot::Node(Node::Leaf(pair(h.depth + 1, old, new)));
+                    None
                 }
-                Slot::Entry(_) => h.len += 1,
-            }
-            let depth = h.depth + 1;
-            let Slot::Entry(old) = m.remove(i) else {
-                unreachable!("an entry, matched above")
+                Slot::Node(child) => insert(child, hash, key, val),
             };
-            let new = Entry { hash, key, val };
-            m.insert(i, Slot::Node(Node::Leaf(pair(depth, old, new))));
-            None
+            if prev.is_none() {
+                h.len += 1
+            }
+            prev
         }
         Node::Leaf(l) => {
             let t = tag(hash, l.header().depth);
@@ -489,35 +496,35 @@ where
             Some(e.val)
         }
         Node::Inner(inner) => {
-            let h = *inner.header();
-            let bit = bit(hash, h.depth);
-            if h.bitmap & bit == 0 {
+            let f = frag(hash, inner.header().depth);
+            if matches!(slots(inner)[f], Slot::Empty) {
                 return None;
             }
-            let i = index(h.bitmap, bit);
             let mut m = inner.make_mut();
-            let v = match &mut m.items()[i] {
+            let (h, slots) = m.parts();
+            let slot = &mut slots[f];
+            let v = match slot {
                 Slot::Entry(e) if e.hash == hash && e.key.borrow() == q => {
-                    let Slot::Entry(e) = m.remove(i) else {
+                    let Slot::Entry(e) = mem::replace(slot, Slot::Empty) else {
                         unreachable!("an entry, matched above")
                     };
-                    m.header().bitmap &= !bit;
+                    h.bitmap &= !(1 << f);
                     e.val
                 }
-                Slot::Entry(_) => return None,
+                Slot::Empty | Slot::Entry(_) => return None,
                 Slot::Node(child) => {
                     let v = remove(child, hash, q)?;
                     match child {
                         Node::Leaf(l) if l.items().len() == 1 => {
-                            let e = l.remove(0);
-                            m.items()[i] = Slot::Entry(e);
+                            let e = l.swap_remove(0);
+                            *slot = Slot::Entry(e);
                         }
                         _ => settle(child),
                     }
                     v
                 }
             };
-            m.header().len -= 1;
+            h.len -= 1;
             Some(v)
         }
     }
@@ -537,12 +544,9 @@ where
             Some(&mut l.make_mut().into_items()[i].val)
         }
         Node::Inner(inner) => {
-            let h = *inner.header();
-            let bit = bit(hash, h.depth);
-            if h.bitmap & bit == 0 {
-                return None;
-            }
-            match &mut inner.make_mut().into_items()[index(h.bitmap, bit)] {
+            let f = frag(hash, inner.header().depth);
+            match &mut inner.make_mut().into_items()[f] {
+                Slot::Empty => None,
                 Slot::Entry(e) => {
                     (e.hash == hash && e.key.borrow() == q).then_some(&mut e.val)
                 }
@@ -858,9 +862,43 @@ impl<'a, K, V> Iterator for Ordered<'a, K, V> {
     }
 }
 
+/// An inner node's slots that are not empty, in fragment order.
+struct Occupied<'a, K, V> {
+    slots: &'a [Slot<K, V>],
+    bits: u32,
+}
+
+impl<'a, K, V> Occupied<'a, K, V> {
+    fn new(n: &'a Inner<K, V>) -> Self {
+        Self { slots: n.items(), bits: n.header().bitmap }
+    }
+}
+
+impl<K, V> Clone for Occupied<'_, K, V> {
+    fn clone(&self) -> Self {
+        Self { slots: self.slots, bits: self.bits }
+    }
+}
+
+impl<'a, K, V> Iterator for Occupied<'a, K, V> {
+    type Item = &'a Slot<K, V>;
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a Slot<K, V>> {
+        let f = self.bits.trailing_zeros() as usize;
+        self.bits &= self.bits.wrapping_sub(1);
+        self.slots.get(f)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.bits.count_ones() as usize;
+        (n, Some(n))
+    }
+}
+
 /// A walk of a tree in hash order, with a frame per inner level.
 pub struct Iter<'a, K, V> {
-    stack: [slice::Iter<'a, Slot<K, V>>; MAX_DEPTH as usize + 1],
+    stack: [Occupied<'a, K, V>; MAX_DEPTH as usize + 1],
     top: usize,
     leaf: Ordered<'a, K, V>,
     remaining: usize,
@@ -868,14 +906,14 @@ pub struct Iter<'a, K, V> {
 
 impl<'a, K, V> Iter<'a, K, V> {
     fn new(root: Option<&'a Node<K, V>>) -> Self {
-        let mut stack = array::from_fn(|_| [].iter());
+        let mut stack = array::from_fn(|_| Occupied { slots: &[], bits: 0 });
         let mut leaf = Ordered::empty();
         let mut top = 0;
         match root {
             None => (),
             Some(Node::Leaf(l)) => leaf = Ordered::new(l),
             Some(Node::Inner(n)) => {
-                stack[0] = n.items().iter();
+                stack[0] = Occupied::new(n);
                 top = 1;
             }
         }
@@ -895,13 +933,14 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
             }
             match self.stack[..self.top].last_mut()?.next() {
                 None => self.top -= 1,
+                Some(Slot::Empty) => unreachable!("occupied slots are not empty"),
                 Some(Slot::Entry(e)) => {
                     self.remaining -= 1;
                     return Some((&e.key, &e.val));
                 }
                 Some(Slot::Node(Node::Leaf(l))) => self.leaf = Ordered::new(l),
                 Some(Slot::Node(Node::Inner(n))) => {
-                    self.stack[self.top] = n.items().iter();
+                    self.stack[self.top] = Occupied::new(n);
                     self.top += 1;
                 }
             }
@@ -947,13 +986,14 @@ pub enum SlotRef<'a, K, V> {
     Node(NodeRef<'a, K, V>),
 }
 
-pub struct Slots<'a, K, V>(slice::Iter<'a, Slot<K, V>>);
+pub struct Slots<'a, K, V>(Occupied<'a, K, V>);
 
 impl<'a, K, V> Iterator for Slots<'a, K, V> {
     type Item = SlotRef<'a, K, V>;
 
     fn next(&mut self) -> Option<SlotRef<'a, K, V>> {
         Some(match self.0.next()? {
+            Slot::Empty => unreachable!("occupied slots are not empty"),
             Slot::Entry(e) => SlotRef::Entry(&e.key, &e.val),
             Slot::Node(n) => SlotRef::Node(NodeRef(n)),
         })
@@ -1006,7 +1046,7 @@ impl<'a, K, V> NodeRef<'a, K, V> {
     pub fn contents(&self) -> Contents<'a, K, V> {
         let node: &'a Node<K, V> = self.0;
         match node {
-            Node::Inner(n) => Contents::Inner(Slots(n.items().iter())),
+            Node::Inner(n) => Contents::Inner(Slots(Occupied::new(n))),
             Node::Leaf(n) => Contents::Leaf(Pairs(Ordered::new(n))),
         }
     }
@@ -1059,8 +1099,8 @@ impl<K, V> NodeHandle<K, V> {
         K: Hash + Eq,
     {
         ensure!(depth <= MAX_DEPTH, "depth {depth} is below the deepest inner level");
-        let mut out = Vec::new();
-        let mut bitmap = 0;
+        let mut out = empty_slots();
+        let mut bitmap = 0u32;
         let mut len = 0;
         let mut first_prefix = None;
         for s in slots {
@@ -1073,21 +1113,18 @@ impl<K, V> NodeHandle<K, V> {
                     Slot::Node(child.0)
                 }
             };
-            let (hash, bit) = (slot.hash(), bit(slot.hash(), depth));
+            let (hash, f) = (slot.hash(), frag(slot.hash(), depth));
             let p = prefix(hash, depth);
             ensure!(*first_prefix.get_or_insert(p) == p, "a node's slots share a prefix");
-            ensure!(bitmap < bit, "slots are in fragment order, one per fragment");
-            bitmap |= bit;
+            ensure!(bitmap < 1 << f, "slots are in fragment order, one per fragment");
+            bitmap |= 1 << f;
             len += slot.len();
-            out.push(slot);
+            out[f] = slot;
         }
+        let n = Raw::new(InnerHead { len, bitmap, depth }, 32, out);
         ensure!(len > LEAF, "an inner node holds more than {LEAF} pairs");
-        ensure!(
-            !matches!(out[..], [Slot::Node(Node::Leaf(_))]),
-            "a lone leaf of one hash is the node itself"
-        );
-        let cap = out.len();
-        Ok(Self(Node::Inner(Raw::new(InnerHead { len, bitmap, depth }, cap, out))))
+        ensure!(!lone_leaf(&n), "a lone leaf of one hash is the node itself");
+        Ok(Self(Node::Inner(n)))
     }
 
     /// The leaf at `depth` holding `pairs`, as [`inner`](Self::inner)
