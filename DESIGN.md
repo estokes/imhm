@@ -161,9 +161,47 @@ Leaves against prev:
 Against chunk16, string-key lookups take 4–7× fewer instructions and
 3–11× fewer cycles. imbl still leads on lookups and in-place inserts.
 
+### Wall clock
+
+Same harness and core, ns per operation: the difference between the
+fastest of 7 runs at each of two round counts, the three builds taking
+turns. Reruns agree within 0.5%. Keys are u64 or ArcStr paths.
+
+| operation | keys | N | leaves | prev | imbl |
+|---|---|---|---|---|---|
+| lookup | u64 | 1k | 4.3 | 5.3 | 3.2 |
+| lookup | u64 | 10k | 6.8 | 9.8 | 4.0 |
+| lookup | u64 | 100k | 15.0 | 15.9 | 9.2 |
+| lookup | u64 | 1M | 59.8 | 68.7 | 48.1 |
+| lookup | str | 1k | 8.0 | 8.0 | 9.7 |
+| lookup | str | 10k | 11.0 | 14.0 | 8.6 |
+| lookup | str | 100k | 20.6 | 21.0 | 15.0 |
+| lookup | str | 1M | 72.0 | 88.5 | 74.1 |
+| in-place insert | u64 | 1k | 32.5 | 30.1 | 28.1 |
+| in-place insert | u64 | 10k | 48.9 | 45.0 | 25.9 |
+| in-place insert | u64 | 100k | 73.0 | 62.3 | 40.9 |
+| in-place insert | u64 | 1M | 131.0 | 125.2 | 81.3 |
+| in-place insert | str | 1k | 40.2 | 38.7 | 39.2 |
+| in-place insert | str | 10k | 60.9 | 52.8 | 35.2 |
+| in-place insert | str | 100k | 89.5 | 72.1 | 57.4 |
+| in-place insert | str | 1M | 157.7 | 158.6 | 109.8 |
+| snapshot+insert | u64 | 1k | 454 | 499 | 546 |
+| snapshot+insert | u64 | 10k | 636 | 751 | 730 |
+| snapshot+insert | u64 | 100k | 939 | 1017 | 1034 |
+| snapshot+insert | u64 | 1M | 1122 | 1179 | 1290 |
+| snapshot+insert | str | 1k | 641 | 596 | 644 |
+| snapshot+insert | str | 10k | 767 | 826 | 832 |
+| snapshot+insert | str | 100k | 1031 | 1108 | 1120 |
+| snapshot+insert | str | 1M | 1404 | 1316 | 1466 |
+
+Leaves against prev in time:
+- **Lookups:** 0–31% faster. They're never slower.
+- **In-place inserts:** 0–24% slower.
+- **Snapshot inserts:** 5–15% faster, except for strings at 1k and 1M, where they're about 7% slower.
+
 ## Open decisions
 
-**Keep the leaves?** They buy lookup cycles with instructions, and make
-in-place builds dearer; `main` has the version without them. The leaf
+**Keep the leaves?** They buy lookup time with instructions, and make
+in-place builds slower; `main` has the version without them. The leaf
 lookup's fixed cost (tag compare, candidate mask, bounds check) is about
 15–35 instructions more than an inline entry's hash-and-key compare.
