@@ -121,30 +121,45 @@ impl<H, T> Raw<H, T> {
     }
 
     /// This node to change, first copied if another version holds it.
+    #[inline]
     pub(crate) fn make_mut(&mut self) -> RawMut<'_, H, T>
     where
         H: Clone,
         T: Clone,
     {
         if !self.is_unique() {
-            *self = Self::new(
-                self.header().clone(),
-                self.count(),
-                self.items().iter().cloned(),
-            );
+            self.copy()
         }
         RawMut(self)
     }
 
+    /// Points this handle at a copy of the node.
+    fn copy(&mut self)
+    where
+        H: Clone,
+        T: Clone,
+    {
+        *self =
+            Self::new(self.header().clone(), self.count(), self.items().iter().cloned());
+    }
+
     /// Adds `item` after the others.
+    #[inline]
     pub(crate) fn push(&mut self, item: T)
     where
         H: Clone,
         T: Clone,
     {
-        if self.is_unique() {
-            return RawMut(self).push(item);
-        }
+        if self.is_unique() { RawMut(self).push(item) } else { self.copy_with(item) }
+    }
+
+    /// Points this handle at a copy of the node with `item` after the
+    /// others.
+    fn copy_with(&mut self, item: T)
+    where
+        H: Clone,
+        T: Clone,
+    {
         let items = self.items().iter().cloned().chain([item]);
         *self = Self::new(self.header().clone(), self.count() + 1, items);
     }
@@ -263,6 +278,7 @@ impl<'a, H, T> RawMut<'a, H, T> {
     }
 
     /// Adds `item` after the others.
+    #[inline]
     pub(crate) fn push(&mut self, item: T) {
         let count = self.0.count();
         if count == self.0.cap() {

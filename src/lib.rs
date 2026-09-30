@@ -36,7 +36,7 @@ const MAX_DEPTH: u8 = 12;
 /// The most pairs a leaf holds, unless all of them share one hash.
 pub const LEAF: usize = 32;
 /// The room a new leaf of two has.
-const PAIR_CAP: usize = 4;
+const PAIR_CAP: usize = 8;
 const MUL: u64 = 0x9e37_79b9_7f4a_7c15;
 
 /// Spreads the hasher's entropy over every bit the trie reads. A
@@ -85,7 +85,8 @@ struct InnerHead {
 }
 
 /// For the first [`LEAF`] entries: `tags[i]` is the [`tag`] of entry
-/// `i`'s hash, and `order` lists their indices in hash order.
+/// `i`'s hash, and `order` lists their indices in hash order. Past the
+/// entries, the tags are 0 and the order [`lanes::GONE`].
 #[derive(Clone, Copy)]
 struct LeafHead {
     depth: u8,
@@ -192,17 +193,17 @@ impl<K, V> Slot<K, V> {
     }
 }
 
-/// The byte of `hash` just below the fragments above `depth`, so a
-/// leaf's tags are in the order of its hashes.
+/// The byte of `hash` just below the fragments above `depth`, or 1 for
+/// 0, so a leaf's tags are in the order of its hashes and none is 0.
 #[inline]
 fn tag(hash: u64, depth: u8) -> u8 {
-    hash.checked_shl(BITS * depth as u32).map_or(0, |h| (h >> 56) as u8)
+    top_tag(hash.checked_shl(BITS * depth as u32).unwrap_or(0))
 }
 
-/// Bits `0..n` for `n` at most [`LEAF`].
+/// The tag of a hash whose fragments above the leaf are shifted out.
 #[inline]
-fn live(n: usize) -> u32 {
-    ((1u64 << n) - 1) as u32
+fn top_tag(rest: u64) -> u8 {
+    ((rest >> 56) as u8).max(1)
 }
 
 /// The header of a leaf at `depth` of `entries`, in hash order.
@@ -210,11 +211,12 @@ fn leaf_head<'a, K: 'a, V: 'a>(
     depth: u8,
     entries: impl IntoIterator<Item = &'a Entry<K, V>>,
 ) -> LeafHead {
-    let mut tags = [0; LEAF];
-    for (t, e) in tags.iter_mut().zip(entries) {
-        *t = tag(e.hash, depth)
+    let (mut tags, mut order) = ([0; LEAF], [lanes::GONE; LEAF]);
+    for (i, e) in entries.into_iter().take(LEAF).enumerate() {
+        tags[i] = tag(e.hash, depth);
+        order[i] = i as u8;
     }
-    LeafHead { depth, tags, order: array::from_fn(|i| i as u8) }
+    LeafHead { depth, tags, order }
 }
 
 /// The leaf at `depth` of `entries`, in hash order.
@@ -332,16 +334,33 @@ where
     Q: Eq + ?Sized,
 {
     let entries = l.items();
-    let tagged = entries.len().min(LEAF);
-    let mut m = lanes::eq(&l.header().tags, t) & live(tagged);
-    while m != 0 {
-        let i = m.trailing_zeros() as usize;
-        // SAFETY: `m` has no bit at or above `tagged`, at most the length.
-        let e = unsafe { entries.get_unchecked(i) };
+    leaf_match(entries, same_tag(l, t), hash, q)
+}
+
+/// The entries tagged `t`, which is not 0.
+#[inline]
+fn same_tag<K, V>(l: &Leaf<K, V>, t: u8) -> lanes::Mask {
+    lanes::eq(&l.header().tags, t)
+}
+
+/// The index of `q` among `entries`, `same` holding those tagged like
+/// it.
+#[inline]
+fn leaf_match<K, V, Q>(
+    entries: &[Entry<K, V>],
+    same: lanes::Mask,
+    hash: u64,
+    q: &Q,
+) -> Option<usize>
+where
+    K: Borrow<Q>,
+    Q: Eq + ?Sized,
+{
+    for i in same {
+        let e = &entries[i];
         if (cheap_eq::<K>() || e.hash == hash) && e.key.borrow() == q {
             return Some(i);
         }
-        m &= m - 1;
     }
     if entries.len() > LEAF {
         return untagged_index(entries, hash, q);
@@ -375,7 +394,7 @@ where
     loop {
         match n {
             Node::Leaf(l) => {
-                let i = leaf_index(l, (rest >> 56) as u8, hash, q)?;
+                let i = leaf_index(l, top_tag(rest), hash, q)?;
                 // SAFETY: `leaf_index` returns an index of an entry.
                 let e = unsafe { l.items().get_unchecked(i) };
                 return Some((&e.key, &e.val));
@@ -434,19 +453,18 @@ fn insert<K: Eq + Clone, V: Clone>(
         }
         Node::Leaf(l) => {
             let t = tag(hash, l.header().depth);
-            if let Some(i) = leaf_index(l, t, hash, &key) {
+            let same = same_tag(l, t);
+            if let Some(i) = leaf_match(l.items(), same, hash, &key) {
                 return Some(mem::replace(&mut l.make_mut().items()[i].val, val));
             }
             let (entries, h) = (l.items(), l.header());
             let n = entries.len();
             let new = Entry { hash, key, val };
             if n < LEAF {
-                let mut ties = lanes::eq(&h.tags, t) & live(n);
-                let mut rank = (lanes::below(&h.tags, t) & live(n)).count_ones() as usize;
-                while ties != 0 {
-                    rank +=
-                        (entries[ties.trailing_zeros() as usize].hash <= hash) as usize;
-                    ties &= ties - 1;
+                let unused = LEAF - n;
+                let mut rank = lanes::below(&h.tags, t).count() - unused;
+                for i in same {
+                    rank += (entries[i].hash <= hash) as usize;
                 }
                 l.push(new);
                 let mut m = l.make_mut();
@@ -485,12 +503,13 @@ where
             if n <= LEAF {
                 let mut m = l.make_mut();
                 let h = m.header();
-                let rank = (lanes::eq(&h.order, i as u8) & live(n)).trailing_zeros();
-                lanes::remove(&mut h.order, rank as usize);
+                let rank = lanes::eq(&h.order, i as u8).first();
+                lanes::remove(&mut h.order, rank.expect("each entry has a rank"));
+                h.tags[i] = h.tags[n - 1];
+                h.tags[n - 1] = 0;
                 if i != n - 1 {
-                    h.tags[i] = h.tags[n - 1];
-                    let moved = lanes::eq(&h.order, (n - 1) as u8) & live(n - 1);
-                    h.order[moved.trailing_zeros() as usize] = i as u8;
+                    let moved = lanes::eq(&h.order, (n - 1) as u8).first();
+                    h.order[moved.expect("each entry has a rank")] = i as u8;
                 }
             }
             Some(e.val)

@@ -105,6 +105,8 @@ fn check_node<K: Hash + Eq, V, S: BuildHasher>(s: &S, n: &Node<K, V>) -> usize {
             for (i, e) in es[..tagged].iter().enumerate() {
                 assert_eq!(h.tags[i], tag(e.hash, d))
             }
+            assert!(h.tags[tagged..].iter().all(|&t| t == 0));
+            assert!(h.order[tagged..].iter().all(|&o| o == lanes::GONE));
             es.len()
         }
         Node::Inner(inner) => {
@@ -253,28 +255,20 @@ fn lanes_agree() {
         inserted.pop();
         let mut removed = x.to_vec();
         removed.remove(i);
-        removed.push(0);
-        for (eq_fn, below_fn, insert_fn, remove_fn) in [
-            (
-                lanes::eq as fn(&_, _) -> _,
-                lanes::below as fn(&_, _) -> _,
-                lanes::insert as fn(&mut _, _, _),
-                lanes::remove as fn(&mut _, _),
-            ),
-            (
-                lanes::scalar_eq,
-                lanes::scalar_below,
-                lanes::scalar_insert,
-                lanes::scalar_remove,
-            ),
-        ] {
-            assert_eq!(eq_fn(&x, t), eq);
-            assert_eq!(below_fn(&x, t), below);
+        removed.push(lanes::GONE);
+        assert_eq!(lanes::eq(&x, t).bits(), eq);
+        assert_eq!(lanes::below(&x, t).bits(), below);
+        assert_eq!(lanes::scalar_eq(&x, t), eq);
+        assert_eq!(lanes::scalar_below(&x, t), below);
+        assert_eq!(lanes::eq(&x, t).count(), eq.count_ones() as usize);
+        for insert in [lanes::insert, lanes::scalar_insert] {
             let mut y = x;
-            insert_fn(&mut y, i, v);
+            insert(&mut y, i, v);
             assert_eq!(y[..], inserted[..]);
+        }
+        for remove in [lanes::remove, lanes::scalar_remove] {
             let mut y = x;
-            remove_fn(&mut y, i);
+            remove(&mut y, i);
             assert_eq!(y[..], removed[..]);
         }
     }
