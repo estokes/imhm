@@ -137,6 +137,13 @@ after the operation, other versions are untouched, and nothing leaks.
   is dropped only once the tree is whole again, and before the return
   value exists: a destructor that panics while a function returns leaks
   that value (rust-lang/rust#47949).
+- **Replaced nodes wait.** A node copied because it was shared may lose
+  every other holder while it's being copied, for example to another
+  thread dropping its version. The handle the copy replaces would then
+  be the last, and dropping it would drop the entries mid-change. So a
+  change releases each replaced handle with one atomic decrement, and
+  if that was the last, keeps the node in a `Grave` that it drops once
+  the tree is whole.
 
 ## Unsafe code
 

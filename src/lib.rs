@@ -283,7 +283,11 @@ fn build<K, V>(
 
 /// Every entry under `node`, in hash order, moved out of the nodes no
 /// other version holds, which are left empty.
-fn drain_into<K: Clone, V: Clone>(node: &mut Node<K, V>, out: &mut Vec<Entry<K, V>>) {
+fn drain_into<K: Clone, V: Clone>(
+    node: &mut Node<K, V>,
+    out: &mut Vec<Entry<K, V>>,
+    g: &mut Grave<K, V>,
+) {
     match node {
         Node::Leaf(l) => out.extend(sorted_items(l)),
         Node::Inner(n) => {
@@ -291,16 +295,50 @@ fn drain_into<K: Clone, V: Clone>(node: &mut Node<K, V>, out: &mut Vec<Entry<K, 
                 match slot {
                     Slot::Empty => (),
                     Slot::Entry(e) => out.push(e),
-                    Slot::Node(mut c) => drain_into(&mut c, out),
+                    Slot::Node(mut c) => {
+                        drain_into(&mut c, out, g);
+                        g.bury(c)
+                    }
                 }
             }
         }
     }
 }
 
+/// Nodes a change replaced whose last handle it held. Dropping one drops
+/// its entries, running user code that may panic, so a change finishes
+/// its grave only once the tree is whole again.
+struct Grave<K, V> {
+    leaves: Vec<Leaf<K, V>>,
+    inners: Vec<Inner<K, V>>,
+}
+
+impl<K, V> Grave<K, V> {
+    fn new() -> Self {
+        Self { leaves: Vec::new(), inners: Vec::new() }
+    }
+
+    fn bury(&mut self, n: Node<K, V>) {
+        match n {
+            Node::Leaf(l) => l.release(&mut self.leaves),
+            Node::Inner(n) => n.release(&mut self.inners),
+        }
+    }
+
+    /// Drops what was buried; the tree must be whole again.
+    #[inline]
+    fn finish(self) {
+        if self.leaves.capacity() == 0 && self.inners.capacity() == 0 {
+            mem::forget(self)
+        } else {
+            drop(self)
+        }
+    }
+}
+
 /// Makes an inner node that now holds at most [`LEAF`] pairs, or only
 /// one leaf, a leaf.
-fn settle<K: Clone, V: Clone>(node: &mut Node<K, V>) {
+fn settle<K: Clone, V: Clone>(node: &mut Node<K, V>, g: &mut Grave<K, V>) {
     let Node::Inner(n) = node else { return };
     let h = *n.header();
     if h.len > LEAF && !lone_leaf(n) {
@@ -308,8 +346,8 @@ fn settle<K: Clone, V: Clone>(node: &mut Node<K, V>) {
     }
     let (depth, len) = (h.depth, h.len);
     let mut entries = Vec::with_capacity(len);
-    drain_into(node, &mut entries);
-    *node = build(depth, &mut entries.drain(..), len);
+    drain_into(node, &mut entries, g);
+    g.bury(mem::replace(node, build(depth, &mut entries.drain(..), len)));
 }
 
 /// Whether the node's only slot is a leaf, whose entries share one hash.
@@ -420,10 +458,11 @@ fn insert<K: Eq + Clone, V: Clone>(
     hash: u64,
     key: K,
     val: V,
+    g: &mut Grave<K, V>,
 ) -> Option<V> {
     match node {
         Node::Inner(inner) => {
-            let mut m = inner.make_mut();
+            let mut m = inner.make_mut(&mut g.inners);
             let (h, slots) = m.parts();
             let f = frag(hash, h.depth);
             let slot = &mut slots[f];
@@ -444,7 +483,7 @@ fn insert<K: Eq + Clone, V: Clone>(
                     *slot = Slot::Node(Node::Leaf(pair(h.depth + 1, old, new)));
                     None
                 }
-                Slot::Node(child) => insert(child, hash, key, val),
+                Slot::Node(child) => insert(child, hash, key, val, g),
             };
             if prev.is_none() {
                 h.len += 1
@@ -455,7 +494,8 @@ fn insert<K: Eq + Clone, V: Clone>(
             let t = tag(hash, l.header().depth);
             let same = same_tag(l, t);
             if let Some(i) = leaf_match(l.items(), same, hash, &key) {
-                return without(key, mem::replace(&mut l.make_mut().items()[i].val, val));
+                let slot = &mut l.make_mut(&mut g.leaves).into_items()[i].val;
+                return without(key, mem::replace(slot, val));
             }
             let (entries, h) = (l.items(), l.header());
             let n = entries.len();
@@ -466,21 +506,21 @@ fn insert<K: Eq + Clone, V: Clone>(
                 for i in same {
                     rank += (entries[i].hash <= hash) as usize;
                 }
-                l.push(new);
-                let mut m = l.make_mut();
+                l.push(new, &mut g.leaves);
+                let mut m = l.make_mut(&mut g.leaves);
                 let h = m.header();
                 h.tags[n] = t;
                 lanes::insert(&mut h.order, rank, n as u8);
             } else if [0, LEAF - 1].map(|k| entries[h.order[k] as usize].hash)
                 == [hash; 2]
             {
-                l.push(new);
+                l.push(new, &mut g.leaves);
             } else {
                 let depth = h.depth;
                 let mut entries = sorted_items(l);
                 let at = entries.partition_point(|e| e.hash <= hash);
                 entries.insert(at, new);
-                *node = build(depth, &mut entries.drain(..), n + 1);
+                g.bury(mem::replace(node, build(depth, &mut entries.drain(..), n + 1)));
             }
             None
         }
@@ -496,13 +536,13 @@ fn without<K, V>(key: K, val: V) -> Option<V> {
 
 /// Makes every node under `node` one no other version holds, copying
 /// those shared, so taking the subtree apart runs no user code.
-fn unshare<K: Clone, V: Clone>(node: &mut Node<K, V>) {
+fn unshare<K: Clone, V: Clone>(node: &mut Node<K, V>, g: &mut Grave<K, V>) {
     match node {
-        Node::Leaf(l) => drop(l.make_mut()),
+        Node::Leaf(l) => drop(l.make_mut(&mut g.leaves)),
         Node::Inner(n) => {
-            for slot in n.make_mut().into_items() {
+            for slot in n.make_mut(&mut g.inners).into_items() {
                 if let Slot::Node(c) = slot {
-                    unshare(c)
+                    unshare(c, g)
                 }
             }
         }
@@ -523,7 +563,12 @@ fn collapses<K, V>(n: &Inner<K, V>, f: usize) -> bool {
 /// nothing. The entry is returned whole, so its key is dropped only once
 /// the tree is whole again. Every copy is made before anything moves,
 /// so a panicking clone leaves the map as it was.
-fn remove<K, V, Q>(node: &mut Node<K, V>, hash: u64, q: &Q) -> Option<Entry<K, V>>
+fn remove<K, V, Q>(
+    node: &mut Node<K, V>,
+    hash: u64,
+    q: &Q,
+    g: &mut Grave<K, V>,
+) -> Option<Entry<K, V>>
 where
     K: Borrow<Q> + Clone,
     V: Clone,
@@ -533,9 +578,9 @@ where
         Node::Leaf(l) => {
             let i = leaf_index(l, tag(hash, l.header().depth), hash, q)?;
             let n = l.items().len();
-            let e = l.swap_remove(i);
+            let e = l.swap_remove(i, &mut g.leaves);
             if n <= LEAF {
-                let mut m = l.make_mut();
+                let mut m = l.make_mut(&mut g.leaves);
                 let h = m.header();
                 let rank = lanes::eq(&h.order, i as u8).first();
                 lanes::remove(&mut h.order, rank.expect("each entry has a rank"));
@@ -554,10 +599,10 @@ where
                 return None;
             }
             if collapses(inner, f) {
-                unshare(node);
+                unshare(node, g);
             }
             let Node::Inner(inner) = node else { unreachable!("still inner") };
-            let mut m = inner.make_mut();
+            let mut m = inner.make_mut(&mut g.inners);
             let (h, slots) = m.parts();
             let slot = &mut slots[f];
             let v = match slot {
@@ -570,13 +615,15 @@ where
                 }
                 Slot::Empty | Slot::Entry(_) => return None,
                 Slot::Node(child) => {
-                    let e = remove(child, hash, q)?;
+                    let e = remove(child, hash, q, g)?;
                     match child {
                         Node::Leaf(l) if l.items().len() == 1 => {
-                            let e = l.swap_remove(0);
-                            *slot = Slot::Entry(e);
+                            let last = Slot::Entry(l.swap_remove(0, &mut g.leaves));
+                            if let Slot::Node(old) = mem::replace(slot, last) {
+                                g.bury(old)
+                            }
                         }
-                        _ => settle(child),
+                        _ => settle(child, g),
                     }
                     e
                 }
@@ -589,7 +636,12 @@ where
 
 /// The value of `q`, which must be present: a miss would copy the path
 /// for nothing.
-fn get_mut<'a, K, V, Q>(node: &'a mut Node<K, V>, hash: u64, q: &Q) -> Option<&'a mut V>
+fn get_mut<'a, K, V, Q>(
+    node: &'a mut Node<K, V>,
+    hash: u64,
+    q: &Q,
+    g: &mut Grave<K, V>,
+) -> Option<&'a mut V>
 where
     K: Borrow<Q> + Clone,
     V: Clone,
@@ -598,16 +650,16 @@ where
     match node {
         Node::Leaf(l) => {
             let i = leaf_index(l, tag(hash, l.header().depth), hash, q)?;
-            Some(&mut l.make_mut().into_items()[i].val)
+            Some(&mut l.make_mut(&mut g.leaves).into_items()[i].val)
         }
         Node::Inner(inner) => {
             let f = frag(hash, inner.header().depth);
-            match &mut inner.make_mut().into_items()[f] {
+            match &mut inner.make_mut(&mut g.inners).into_items()[f] {
                 Slot::Empty => None,
                 Slot::Entry(e) => {
                     (e.hash == hash && e.key.borrow() == q).then_some(&mut e.val)
                 }
-                Slot::Node(child) => get_mut(child, hash, q),
+                Slot::Node(child) => get_mut(child, hash, q, g),
             }
         }
     }
@@ -733,7 +785,12 @@ where
     pub fn insert_cow(&mut self, key: K, val: V) -> Option<V> {
         let hash = hash_of(&self.hasher, &key);
         match &mut self.root {
-            Some(root) => insert(root, hash, key, val),
+            Some(root) => {
+                let mut g = Grave::new();
+                let prev = insert(root, hash, key, val, &mut g);
+                g.finish();
+                prev
+            }
             None => {
                 self.root = Some(Node::Leaf(leaf(0, vec![Entry { hash, key, val }])));
                 None
@@ -751,11 +808,13 @@ where
         let hash = hash_of(&self.hasher, q);
         let root = self.root.as_mut()?;
         find(root, hash, q)?;
-        let e = remove(root, hash, q)?;
+        let mut g = Grave::new();
+        let e = remove(root, hash, q, &mut g)?;
         match root.len() {
-            0 => self.root = None,
-            _ => settle(root),
+            0 => g.bury(self.root.take().expect("a root")),
+            _ => settle(root, &mut g),
         }
+        g.finish();
         without(e.key, e.val)
     }
 
@@ -769,7 +828,10 @@ where
         let hash = hash_of(&self.hasher, q);
         let root = self.root.as_mut()?;
         find(root, hash, q)?;
-        get_mut(root, hash, q)
+        let mut g = Grave::new();
+        let v = get_mut(root, hash, q, &mut g);
+        g.finish();
+        v
     }
 
     /// The value of `key`, first inserting `f()` if it is absent.

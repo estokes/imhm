@@ -11,7 +11,8 @@ use arcstr::ArcStr;
 use compact_str::CompactString;
 use rustc_hash::FxHasher;
 use std::{
-    cell::Cell,
+    any::Any,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet, hash_map::RandomState},
     fmt::Debug,
     hash::Hasher,
@@ -594,6 +595,10 @@ thread_local! {
     /// Clones and drops of `Fragile` left before one panics, when
     /// positive.
     static FUSE: Cell<u64> = const { Cell::new(0) };
+    /// Another holder of a map's nodes, dropped by the next `Fragile`
+    /// clone: as if another thread dropped its version while the map
+    /// copies a node they shared.
+    static VANISH: RefCell<Option<Box<dyn Any>>> = const { RefCell::new(None) };
 }
 
 /// Burns one unit of the fuse, panicking on the last, unless already
@@ -621,6 +626,7 @@ impl Fragile {
 impl Clone for Fragile {
     fn clone(&self) -> Self {
         burn();
+        drop(VANISH.with(|v| v.borrow_mut().take()));
         Fragile(self.0.clone())
     }
 }
@@ -640,7 +646,7 @@ fn ids<S>(m: &Map<Fragile, Fragile, S>) -> HashMap<u64, u64> {
 /// values panic in clone or drop at random points. A panicking operation
 /// leaves its map whole, holding what it held before or after, and
 /// every other version untouched.
-fn fragile<S: BuildHasher + Clone>(hasher: S, size: usize, seed: u64) {
+fn fragile<S: BuildHasher + Clone + 'static>(hasher: S, size: usize, seed: u64) {
     let live = LIVE.with(Cell::get);
     {
         let r = &mut Rng(seed);
@@ -662,6 +668,10 @@ fn fragile<S: BuildHasher + Clone>(hasher: S, size: usize, seed: u64) {
                     }
                 }
                 _ => drop(after.entry(k).or_insert(v)),
+            }
+            if r.below(3) == 0 {
+                let other: Box<dyn Any> = Box::new(versions[i].0.clone());
+                VANISH.with(|v| *v.borrow_mut() = Some(other));
             }
             let m = &mut versions[i].0;
             if r.below(2) == 0 {
@@ -701,6 +711,7 @@ fn fragile<S: BuildHasher + Clone>(hasher: S, size: usize, seed: u64) {
                 }
             }));
             FUSE.with(|f| f.set(0));
+            drop(VANISH.with(|v| v.borrow_mut().take()));
             let now = ids(m);
             match result {
                 Ok(fork) => {

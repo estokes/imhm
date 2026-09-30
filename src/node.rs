@@ -121,52 +121,78 @@ impl<H, T> Raw<H, T> {
         self.head().rc.load(Acquire) == 1
     }
 
+    /// Gives up this handle. The last handle to a node that still holds
+    /// items goes to `grave` instead: dropping it would run the items'
+    /// destructors, which must wait until the caller's structure is
+    /// whole again. A node shared when copied can reach this when every
+    /// other holder drops it meanwhile.
+    pub(crate) fn release(self, grave: &mut Vec<Self>) {
+        let this = mem::ManuallyDrop::new(self);
+        if this.head().rc.fetch_sub(1, Release) != 1 {
+            return;
+        }
+        fence(Acquire);
+        // No other handle exists, so none can see the count between.
+        this.head().rc.store(1, Relaxed);
+        let this = mem::ManuallyDrop::into_inner(this);
+        if this.count() == 0 { drop(this) } else { grave.push(this) }
+    }
+
+    // The methods below that copy a shared node release the handle they
+    // replace to `grave`.
+
     /// This node to change, first copied if another version holds it.
     #[inline]
-    pub(crate) fn make_mut(&mut self) -> RawMut<'_, H, T>
+    pub(crate) fn make_mut(&mut self, grave: &mut Vec<Self>) -> RawMut<'_, H, T>
     where
         H: Clone,
         T: Clone,
     {
         if !self.is_unique() {
-            self.copy()
+            self.copy(grave)
         }
         RawMut(self)
     }
 
     /// Points this handle at a copy of the node.
-    fn copy(&mut self)
+    fn copy(&mut self, grave: &mut Vec<Self>)
     where
         H: Clone,
         T: Clone,
     {
-        *self =
+        let copy =
             Self::new(self.header().clone(), self.count(), self.items().iter().cloned());
+        mem::replace(self, copy).release(grave);
     }
 
     /// Adds `item` after the others.
     #[inline]
-    pub(crate) fn push(&mut self, item: T)
+    pub(crate) fn push(&mut self, item: T, grave: &mut Vec<Self>)
     where
         H: Clone,
         T: Clone,
     {
-        if self.is_unique() { RawMut(self).push(item) } else { self.copy_with(item) }
+        if self.is_unique() {
+            RawMut(self).push(item)
+        } else {
+            self.copy_with(item, grave)
+        }
     }
 
     /// Points this handle at a copy of the node with `item` after the
     /// others.
-    fn copy_with(&mut self, item: T)
+    fn copy_with(&mut self, item: T, grave: &mut Vec<Self>)
     where
         H: Clone,
         T: Clone,
     {
         let items = self.items().iter().cloned().chain([item]);
-        *self = Self::new(self.header().clone(), self.count() + 1, items);
+        let copy = Self::new(self.header().clone(), self.count() + 1, items);
+        mem::replace(self, copy).release(grave);
     }
 
     /// Removes the item at `i`, moving the last item into its place.
-    pub(crate) fn swap_remove(&mut self, i: usize) -> T
+    pub(crate) fn swap_remove(&mut self, i: usize, grave: &mut Vec<Self>) -> T
     where
         H: Clone,
         T: Clone,
@@ -178,7 +204,8 @@ impl<H, T> Raw<H, T> {
         let (last, init) = s.split_last().expect("an item to remove");
         let removed = s[i].clone();
         let items = init.iter().enumerate().map(|(j, x)| if j == i { last } else { x });
-        *self = Self::new(self.header().clone(), s.len() - 1, items.cloned());
+        let copy = Self::new(self.header().clone(), s.len() - 1, items.cloned());
+        mem::replace(self, copy).release(grave);
         removed
     }
 
@@ -250,12 +277,6 @@ impl<'a, H, T> RawMut<'a, H, T> {
         unsafe { &mut self.0.ptr.as_mut().h }
     }
 
-    pub(crate) fn items(&mut self) -> &mut [T] {
-        // SAFETY: no other handle exists, and the first `count` items
-        // are initialized.
-        unsafe { slice::from_raw_parts_mut(self.0.base(), self.0.count()) }
-    }
-
     pub(crate) fn parts(&mut self) -> (&mut H, &mut [T]) {
         // SAFETY: no other handle exists; the header and the items are
         // disjoint parts of the allocation.
@@ -266,7 +287,8 @@ impl<'a, H, T> RawMut<'a, H, T> {
     }
 
     pub(crate) fn into_items(self) -> &'a mut [T] {
-        // SAFETY: as `items`, for the life of the borrow.
+        // SAFETY: no other handle exists for the life of the borrow, and
+        // the first `count` items are initialized.
         unsafe { slice::from_raw_parts_mut(self.0.base(), self.0.count()) }
     }
 
