@@ -34,35 +34,48 @@ last 4 bits.
 - **Canonical rule.** For the pairs under a slot:
   - one pair sits inline in the parent's slot as an entry;
   - 2 to `LEAF` (32) pairs, or any number that all share one full hash,
-    form a **leaf**: a flat node of entries sorted by hash;
+    form a **leaf**;
   - more than that forms an **inner** node.
 
   The rule depends only on the key set, so a key set has exactly one
   shape for a given hasher, whatever the insert and remove history. The
   one exception is the order among keys with the same full hash.
   Iteration is in hash order, so it's deterministic when the hasher is.
-  Keys with the same full hash sit side by side in a leaf, so there's no
-  separate collision type.
-- **Inner node:** a header (`len` = pairs in the subtree, `depth`, a
-  32-bit `bitmap`) and one slot per set bit, in bit order. A slot is an
-  inline entry `(hash, key, val)` or a child node.
-- **Leaf:** a header (`depth`, and `tags`: the low byte of each of the
-  first 32 hashes) and its entries. A lookup compares all 32 tags in one
-  few SIMD instructions (SSE2 on x86_64, NEON on aarch64, both in the
-  baseline of their architecture and on stable Rust; 8 at a time with
-  integer arithmetic elsewhere). That usually leaves one candidate, confirmed by its full
-  hash and key. So the lookup has no data-dependent branch until the
-  final key compare.
+  Keys with the same full hash share a leaf, so there's no separate
+  collision type.
+- **Inner node:** a header (`len` = pairs in the subtree, `depth`, and a
+  32-bit `bitmap` of the slots in use) and 32 slots, one per fragment. A
+  slot is empty, an inline entry `(hash, key, val)`, or a child node. A
+  lookup indexes the slot straight from the hash: no popcount, and the
+  bitmap isn't read. An inner node holds more than 32 pairs, so its
+  slots are mostly full; a compressed node would be nearly as big.
+- **Leaf:** a header and the entries, in the order they were added.
+  - `tags`: one byte per entry for the first 32, the hash's byte just
+    below the leaf's prefix (0 is raised to 1). Unused lanes are 0, so
+    they never match. Tags sort the same way their hashes do.
+  - `order`: the entries' indices in hash order. Iteration, splitting
+    and the node API follow it. Unused lanes are `0xFF`.
+  - **Lookup:** compare the 32 tags with the key's tag, a few SIMD
+    instructions, then check the one or two candidates by hash and key.
+  - **Insert:** push the entry at the end. Its place in `order` is the
+    number of smaller tags, plus a full-hash compare for equal tags, and
+    `order` shifts by one lane from there. **Remove:** move the last
+    entry into the hole and shift `order` back. All of these are
+    fixed-width 32-byte operations with no data-dependent branch.
+  - A new leaf of two has room for 8; a leaf in place grows by doubling.
+    A copy for another version is exactly its size.
+- **Lane operations** (`src/lanes.rs`): equal, less-than, insert-at and
+  remove-at on 32 bytes. SSE2 on x86_64 and NEON on aarch64, both in
+  their architecture's baseline and on stable Rust; plain Rust elsewhere.
+  Each architecture keeps its compare results in the mask layout it
+  makes most cheaply.
 - **Changes.** An insert that fills a leaf past `LEAF` rebuilds it as
   the canonical subtree of its entries. A removal that brings an inner
   node to `LEAF` or fewer pairs, or down to a single leaf, gathers its
   entries into a leaf. Both move the entries when no other version
   holds the node.
 - **Storage** (`src/node.rs`): both node kinds are one reference-counted
-  allocation holding a header and room for `cap` items. A lookup makes
-  one dependent memory load per level. A node no other version holds
-  gains or loses an item in place, moving to an allocation twice the
-  size when full. A copy of a shared node is exactly its item count.
+  allocation holding a header and room for `cap` items.
 - **Hash mix:** the hasher's output passes through
   `h * φ64 ^ (h*φ64 >> 32)`. It spreads entropy into the bits the trie
   reads first, so a weak hasher can't make lopsided trees. It's a
@@ -85,7 +98,8 @@ last 4 bits.
     hasher it used.
 - **Stored hash:** each entry keeps its mixed hash. Pushing an entry
   down a level needs no rehash, and a lookup compares hashes before
-  keys.
+  keys, unless the key is small and has no destructor, when comparing
+  it costs about the same.
 
 ## Node API
 
@@ -112,8 +126,8 @@ shared by several maps is checked once, when it's created.
 
 ## Unsafe code
 
-`src/node.rs`, behind a safe API: `Raw::{new, items, make_mut, insert,
-remove, take_items}` and `RawMut`.
+`src/node.rs`, behind a safe API: `Raw::{new, items, make_mut, push,
+swap_remove, take_items}` and `RawMut`.
 - **Reference counting:** the same protocol as `std::sync::Arc`
   (relaxed increment; release decrement, then an acquire fence before
   the last owner drops the items and frees the memory).
@@ -122,136 +136,156 @@ remove, take_items}` and `RawMut`.
 - **Building:** a drop guard counts the items written, so if cloning a
   key panics partway through a copy, what was written is dropped and the
   empty node frees itself.
-- **Moving items:** in-place insert and remove shift items with
-  `ptr::copy`; growing moves them to the larger allocation and frees the
-  old one without dropping them; `take_items` moves them into a `Vec`
-  and leaves the node empty. No user code runs between a move and the
-  count update that records it.
+- **Moving items:** `swap_remove` moves the last item into the hole;
+  growing moves the items to a larger allocation and frees the old one
+  without dropping them; `take_items` moves them into a `Vec` and
+  leaves the node empty. No user code runs between a move and the count
+  update that records it.
 
-`lib.rs` has one more `unsafe` block per architecture: the SSE2 or NEON
-tag compare. The tests include threads sharing, changing and dropping
-clones of one map. The whole suite passes under Miri on x86_64; the tag
-matcher and leaf tests pass under Miri for aarch64, and the whole suite
-passes natively on an Apple M2.
+`src/lanes.rs` has the SSE2 and NEON intrinsics, each on the 32 bytes
+of one array. `lib.rs` has one unchecked index, of the entry a leaf
+lookup just found. The tests include threads sharing, changing and dropping clones
+of one map. The whole suite passes under Miri on x86_64; the lane and
+leaf tests pass under Miri for aarch64, RISC-V and s390x (big-endian),
+and the whole suite passes natively on an Apple M2.
 
 ## Performance
 
-Measured with `perf stat` pinned to one performance core (CPU 2), per
-operation, as the difference between two round counts so map building
-drops out; the harness is `examples/getcount.rs`, driven by
-`scripts/count.sh` and `scripts/wall.sh`. Instructions / cycles;
-"prev" is the version without leaves (branch `no-leaves`).
+ns per operation, wall clock: `examples/getcount.rs`, driven by
+`scripts/wall.sh`, pinned to one performance core (CPU 2) at
+`SCHED_FIFO` 50. Each number is the difference between the fastest of 7
+runs at two round counts, so building the map drops out; the builds
+take turns. Keys are u64 or `ArcStr` paths; the hasher is Fx.
+- **lookup:** every key once.
+- **in-place insert:** build the map from empty in one version.
+- **snapshot+insert:** 100 new keys, each into a new version of the last.
 
-| operation | keys, N | imhm leaves | imhm prev | imbl | chunk16 |
-|---|---|---|---|---|---|
-| lookup | u64, 10k | 110 / 34 | 105 / 51 | 79 / 19 | 110 / 68 |
-| lookup | u64, 1M | 140 / 284 | 132 / 323 | 104 / 207 | 149 / 612 |
-| lookup | ArcStr, 10k | 185 / 52 | 149 / 67 | 152 / 40 | 770 / 483 |
-| lookup | ArcStr, 1M | 213 / 345 | 177 / 413 | 172 / 345 | 1136 / 3646 |
-| in-place insert | u64, 10k | 533 / 221 | 505 / 204 | 280 / 120 | 1702 / 525 |
-| in-place insert | ArcStr, 1M | 894 / 735 | 735 / 718 | 567 / 511 | 5772 / 5348 |
-| snapshot+insert | u64, 10k | 4070 / 3026 | 4320 / 3550 | 4980 / 3418 | 7005 / 3460 |
-| snapshot+insert | ArcStr, 1M | 8631 / 6490 | 7034 / 6216 | 9161 / 6741 | 14716 / 8997 |
+"start" is imhm as of `0c3d573`: compressed inner nodes and sorted
+leaves.
 
-Leaves against prev:
-- **Lookups** take 15–33% fewer cycles at 10k and 1M and about the same
-  at 1k and 100k, because branch misses fall several-fold below 1M. But
-  they cost 5–24% more instructions.
-- **In-place inserts** cost 6–27% more instructions and up to 25% more
-  cycles.
-- **Snapshot inserts** are slightly cheaper at 10k–100k and cost more
-  instructions at 1M.
+| operation | keys | N | imhm | start | imbl | chunk16 |
+|---|---|---|---|---|---|---|
+| lookup | u64 | 1k | 3.0 | 4.3 | 3.5 | 4.7 |
+| lookup | u64 | 10k | 4.2 | 6.8 | 4.2 | 14.2 |
+| lookup | u64 | 100k | 9.3 | 15.0 | 9.1 | 53.7 |
+| lookup | u64 | 1M | 42.0 | 59.8 | 48.7 | 129.6 |
+| lookup | str | 1k | 6.1 | 8.2 | 9.9 | 39.9 |
+| lookup | str | 10k | 8.0 | 11.2 | 8.8 | 105.1 |
+| lookup | str | 100k | 14.1 | 20.2 | 15.0 | 184.0 |
+| lookup | str | 1M | 56.5 | 73.5 | 75.7 | 800.0 |
+| in-place insert | u64 | 1k | 18.9 | 34.5 | 28.7 | 69.4 |
+| in-place insert | u64 | 10k | 23.2 | 51.7 | 25.3 | 120.1 |
+| in-place insert | u64 | 100k | 45.7 | 75.9 | 42.5 | 190.1 |
+| in-place insert | u64 | 1M | 63.3 | 133.8 | 83.0 | 296.4 |
+| in-place insert | str | 1k | 25.8 | 41.8 | 39.8 | 202.0 |
+| in-place insert | str | 10k | 31.5 | 62.4 | 35.1 | 331.9 |
+| in-place insert | str | 100k | 59.1 | 91.0 | 59.1 | 506.4 |
+| in-place insert | str | 1M | 90.3 | 159.6 | 110.3 | 1175.2 |
+| snapshot+insert | u64 | 1k | 420 | 461 | 543 | 492 |
+| snapshot+insert | u64 | 10k | 638 | 637 | 735 | 741 |
+| snapshot+insert | u64 | 100k | 988 | 941 | 1021 | 1007 |
+| snapshot+insert | u64 | 1M | 1092 | 1122 | 1286 | 1340 |
+| snapshot+insert | str | 1k | 642 | 639 | 643 | 775 |
+| snapshot+insert | str | 10k | 806 | 768 | 834 | 1114 |
+| snapshot+insert | str | 100k | 1082 | 1032 | 1104 | 1466 |
+| snapshot+insert | str | 1M | 1409 | 1403 | 1465 | 1910 |
 
-Against chunk16, string-key lookups take 4–7× fewer instructions and
-3–11× fewer cycles. imbl still leads on lookups and in-place inserts.
+Against imbl, imhm is:
+- **Lookups:** 14–38% faster at 1k and 1M, and level or up to 2%
+  slower at 10k and 100k.
+- **In-place inserts:** 18–35% faster at 1k and 1M, 8–10% faster at
+  10k, and level to 8% slower at 100k.
+- **Snapshot inserts:** 0–23% faster at every size.
 
-### Wall clock
+Against "start", snapshot inserts are between 9% faster and 5% slower.
 
-Same harness and core, ns per operation: the difference between the
-fastest of 7 runs at each of two round counts, the three builds taking
-turns. Reruns agree within 0.5%. Keys are u64 or ArcStr paths.
+What closed the gap with imbl, in order of effect:
+- **Inner slots indexed by fragment.** The popcount and the bitmap load
+  were a dependent chain of about 10 cycles per level.
+- **Leaves in insertion order**, with `order` and tags that sort like
+  hashes. A sorted leaf shifted entries and tags on every insert, and
+  the variable-length shifts mispredicted.
+- **The fragment kept in a register**, not loaded from each node's
+  header.
+- **Small fixed costs:** no bounds checks where an invariant holds, no
+  full-hash compare for small keys, tag 0 for unused lanes so a lookup
+  needs no lane mask, inlined fast paths for `make_mut` and `push`, and
+  room for 8 in a new leaf.
 
-| operation | keys | N | leaves | prev | imbl |
-|---|---|---|---|---|---|
-| lookup | u64 | 1k | 4.3 | 5.3 | 3.2 |
-| lookup | u64 | 10k | 6.8 | 9.8 | 4.0 |
-| lookup | u64 | 100k | 15.0 | 15.9 | 9.2 |
-| lookup | u64 | 1M | 59.8 | 68.7 | 48.1 |
-| lookup | str | 1k | 8.0 | 8.0 | 9.7 |
-| lookup | str | 10k | 11.0 | 14.0 | 8.6 |
-| lookup | str | 100k | 20.6 | 21.0 | 15.0 |
-| lookup | str | 1M | 72.0 | 88.5 | 74.1 |
-| in-place insert | u64 | 1k | 32.5 | 30.1 | 28.1 |
-| in-place insert | u64 | 10k | 48.9 | 45.0 | 25.9 |
-| in-place insert | u64 | 100k | 73.0 | 62.3 | 40.9 |
-| in-place insert | u64 | 1M | 131.0 | 125.2 | 81.3 |
-| in-place insert | str | 1k | 40.2 | 38.7 | 39.2 |
-| in-place insert | str | 10k | 60.9 | 52.8 | 35.2 |
-| in-place insert | str | 100k | 89.5 | 72.1 | 57.4 |
-| in-place insert | str | 1M | 157.7 | 158.6 | 109.8 |
-| snapshot+insert | u64 | 1k | 454 | 499 | 546 |
-| snapshot+insert | u64 | 10k | 636 | 751 | 730 |
-| snapshot+insert | u64 | 100k | 939 | 1017 | 1034 |
-| snapshot+insert | u64 | 1M | 1122 | 1179 | 1290 |
-| snapshot+insert | str | 1k | 641 | 596 | 644 |
-| snapshot+insert | str | 10k | 767 | 826 | 832 |
-| snapshot+insert | str | 100k | 1031 | 1108 | 1120 |
-| snapshot+insert | str | 1M | 1404 | 1316 | 1466 |
+### Target CPU (x86_64)
 
-Leaves against prev in time:
-- **Lookups:** 0–31% faster. They're never slower.
-- **In-place inserts:** 0–24% slower.
-- **Snapshot inserts:** 5–15% faster, except for strings at 1k and 1M, where they're about 7% slower.
+Lookups no longer use popcount, so a baseline x86-64 build loses little:
 
-### SIMD and target CPU (x86_64)
-
-Lookup ns, the same method. AVX2 compares all 32 tags in one
-instruction, but it was no faster than SSE2's two compares, and choosing
-it at run time made a baseline build slightly slower than plain SSE2, so
-only SSE2 remains. The target CPU matters much more: a baseline x86-64
-build has no POPCNT, and every inner node pays for a software bit count.
-
-| keys, N | native | x86-64-v3 | x86-64-v2 | x86-64 |
+| operation | keys, N | native | x86-64-v2 | x86-64 |
 |---|---|---|---|---|
-| u64, 10k | 6.8 | 6.9 | 8.0 | 10.2 |
-| u64, 1M | 60.2 | 58.9 | 64.6 | 75.4 |
-| str, 10k | 11.0 | 10.9 | 11.5 | 14.2 |
-| str, 1M | 72.3 | 72.4 | 74.0 | 92.5 |
+| lookup | u64, 10k | 4.2 | 4.5 | 4.6 |
+| lookup | u64, 1M | 42.2 | 42.4 | 42.3 |
+| lookup | str, 10k | 8.0 | 8.0 | 8.1 |
+| lookup | str, 1M | 56.4 | 57.1 | 57.0 |
+| in-place insert | u64, 10k | 22.9 | 23.0 | 23.9 |
+| in-place insert | u64, 1M | 64.2 | 65.5 | 66.9 |
+| in-place insert | str, 10k | 31.9 | 32.5 | 33.0 |
+| in-place insert | str, 1M | 92.4 | 92.7 | 95.1 |
 
-Build for x86-64-v3 (or at least v2) where the hardware allows.
+AVX2 compares all 32 tags in one instruction but measured no faster
+than SSE2's two, and choosing it at run time made a baseline build
+slower, so only SSE2 is used.
 
 ### Apple M2
 
-Wall clock ns per operation, fastest of 7 (5 for inserts), not pinned.
-The portable matcher is what a target without SIMD support gets.
+Same harness, not pinned (macOS has no affinity), fastest of 5.
 
-| operation | keys, N | leaves, NEON | leaves, portable | prev | imbl |
+| operation | keys | N | imhm | imbl | chunk16 |
 |---|---|---|---|---|---|
-| lookup | u64, 1k | 6.4 | 11.0 | 7.1 | 3.3 |
-| lookup | u64, 10k | 9.8 | 16.4 | 17.2 | 4.8 |
-| lookup | u64, 100k | 16.7 | 27.1 | 18.7 | 6.8 |
-| lookup | u64, 1M | 53.6 | 66.1 | 68.1 | 37.7 |
-| lookup | str, 1k | 12.2 | 17.2 | 16.7 | 8.2 |
-| lookup | str, 10k | 14.7 | 19.7 | 22.7 | 10.0 |
-| lookup | str, 100k | 22.1 | 30.5 | 24.2 | 12.8 |
-| lookup | str, 1M | 69.8 | 77.6 | 89.6 | 59.6 |
-| in-place insert | u64, 10k | 72.2 | | 67.0 | 19.8 |
-| in-place insert | u64, 1M | 167.1 | | 155.0 | 88.4 |
-| in-place insert | str, 10k | 80.7 | | 74.1 | 27.2 |
-| in-place insert | str, 1M | 189.4 | | 177.8 | 121.0 |
-| snapshot+insert | u64, 10k | 328 | | 383 | 431 |
-| snapshot+insert | u64, 1M | 713 | | 693 | 849 |
-| snapshot+insert | str, 10k | 370 | | 376 | 464 |
-| snapshot+insert | str, 1M | 856 | | 714 | 1015 |
+| lookup | u64 | 1k | 4.3 | 3.5 | 5.7 |
+| lookup | u64 | 10k | 6.3 | 4.8 | 20.7 |
+| lookup | u64 | 100k | 9.0 | 6.9 | 53.6 |
+| lookup | u64 | 1M | 37.6 | 37.1 | 100.2 |
+| lookup | str | 1k | 8.4 | 8.4 | 57.1 |
+| lookup | str | 10k | 10.5 | 10.0 | 130.5 |
+| lookup | str | 100k | 13.9 | 13.2 | 210.0 |
+| lookup | str | 1M | 52.3 | 59.1 | 592.4 |
+| in-place insert | u64 | 1k | 22.7 | 25.1 | 71.0 |
+| in-place insert | u64 | 10k | 26.8 | 19.7 | 118.8 |
+| in-place insert | u64 | 100k | 47.6 | 36.2 | 177.2 |
+| in-place insert | u64 | 1M | 80.2 | 86.4 | 287.5 |
+| in-place insert | str | 1k | 28.3 | 33.2 | 179.6 |
+| in-place insert | str | 10k | 35.1 | 27.2 | 284.2 |
+| in-place insert | str | 100k | 60.0 | 47.8 | 413.9 |
+| in-place insert | str | 1M | 108.9 | 118.8 | 875.1 |
+| snapshot+insert | u64 | 1k | 259 | 369 | 281 |
+| snapshot+insert | u64 | 10k | 320 | 430 | 427 |
+| snapshot+insert | u64 | 100k | 528 | 659 | 575 |
+| snapshot+insert | u64 | 1M | 692 | 909 | 792 |
+| snapshot+insert | str | 1k | 303 | 373 | 421 |
+| snapshot+insert | str | 10k | 370 | 459 | 655 |
+| snapshot+insert | str | 100k | 555 | 669 | 905 |
+| snapshot+insert | str | 1M | 780 | 980 | 1112 |
 
-On the M2, the leaves make lookups 5–44% faster than without them.
-imbl's lead on lookups and in-place inserts is wider than on x86.
+The M2 runs close to 5 instructions a cycle, so instruction count is
+what it pays for. A u64 lookup there is about 100 instructions to x86's
+82: LLVM expands the NEON narrowing shift and bit select into shifts,
+ANDs and ORs, and 64-bit constants take 4 instructions each. imbl
+compares 16 tags per lookup, imhm 32.
+
+### Memory
+
+Heap bytes, from `examples/mem.rs`: built in place, then each of 100
+snapshot inserts kept.
+
+| | per pair, 10k | per pair, 1M | per snapshot insert, 10k | per snapshot insert, 1M |
+|---|---|---|---|---|
+| imhm | 45.5 | 50.5 | 2486 | 4246 |
+| imbl | 47.5 | 103.5 | 2059 | 3432 |
+| chunk16 | 29.8 | 27.2 | 1102 | 1508 |
+
+(u64 keys; `ArcStr` keys are within 2%, the strings themselves shared.)
+A snapshot insert copies each inner node on its path, all 32 slots.
 
 ## Open work
 
-**In-place inserts** are slower with leaves. The leaf lookup's fixed
-cost (tag compare, candidate mask, bounds check) is also about 15–35
-instructions more than an inline entry's hash-and-key compare.
-
-**Baseline x86-64 builds** could get POPCNT back by compiling lookup
-twice and choosing at run time, at the cost of a check per lookup.
+- **M2 lookups at 10k–100k** trail imbl by up to 30%. Hand-written NEON
+  that LLVM leaves alone, or 16-lane leaf groups as imbl has, might
+  close it.
+- **Snapshot memory** is 2.5–3× chunk16's per persistent insert,
+  because inner nodes are copied whole.
