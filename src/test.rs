@@ -62,79 +62,89 @@ impl<const SHIFT: u32> BuildHasher for Placed<SHIFT> {
     }
 }
 
-/// Keys whose trie hashes share most fragments, so chains run to the
-/// deepest level, and with `SHIFT` > 0 whole groups collide.
+/// Keys in groups whose trie hashes share all but their last 4 bits.
+/// Keys equal but for their low `SHIFT` bits share a hash, so with
+/// `SHIFT` > 0 a group outgrows a leaf and chains to the deepest level.
 fn placed_key<const SHIFT: u32>(rng: &mut Rng) -> u64 {
-    let trie = rng.below(16) << (62 - SHIFT) | rng.below(4) << 25 | rng.below(3);
+    let trie = rng.below(2) << (63 - SHIFT) | rng.below(4) << 20 | rng.below(16);
     trie << SHIFT | rng.below(1 << SHIFT)
 }
 
 fn check<K: Hash + Eq, V, S: BuildHasher>(m: &Map<K, V, S>) {
     if let Some(r) = &m.root {
         assert_eq!(r.depth(), 0);
-        assert!(!r.slots().is_empty());
+        assert!(r.len() > 0);
         check_node(&m.hasher, r);
     }
     assert_eq!(m.iter().count(), m.len());
+    let hashes: Vec<u64> = m.iter().map(|(k, _)| hash_of(&m.hasher, k)).collect();
+    assert!(hashes.is_sorted(), "iteration is in hash order");
 }
 
 fn check_node<K: Hash + Eq, V, S: BuildHasher>(s: &S, n: &Node<K, V>) -> usize {
-    assert!(n.depth() <= MAX_DEPTH);
-    assert_eq!(n.slots().len(), n.bitmap().count_ones() as usize);
-    assert!(
-        n.depth() == 0 || !matches!(n.slots()[..], [Slot::Entry(_) | Slot::Collision(_)])
-    );
-    let p = prefix(n.slots()[0].hash(), n.depth());
-    let mut bits = n.bitmap();
-    let mut len = 0;
-    for slot in n.slots() {
-        let h = slot.hash();
-        assert_eq!(prefix(h, n.depth()), p);
-        assert_eq!(bit(h, n.depth()), 1 << bits.trailing_zeros());
-        bits &= bits - 1;
-        len += match slot {
-            Slot::Entry(e) => {
+    let d = n.depth();
+    match n {
+        Node::Leaf(l) => {
+            let es = l.items();
+            assert!(d <= MAX_DEPTH + 1);
+            assert!(es.len() >= if d > 0 { 2 } else { 1 });
+            let first = es[0].hash;
+            assert!(es.len() <= LEAF || es.iter().all(|e| e.hash == first));
+            for (i, e) in es.iter().enumerate() {
                 assert_eq!(e.hash, hash_of(s, &e.key));
-                1
-            }
-            Slot::Collision(c) => {
-                assert!(c.pairs.len() >= 2);
-                for (i, (k, _)) in c.pairs.iter().enumerate() {
-                    assert_eq!(hash_of(s, k), c.hash);
-                    assert!(c.pairs[..i].iter().all(|(prev, _)| prev != k));
+                assert_eq!(prefix(e.hash, d), prefix(first, d));
+                assert!(i == 0 || es[i - 1].hash <= e.hash);
+                assert!(es[..i].iter().all(|p| p.key != e.key));
+                if i < LEAF {
+                    assert_eq!(l.header().tags[i], e.hash as u8)
                 }
-                c.pairs.len()
             }
-            Slot::Node(child) => {
-                assert_eq!(child.depth(), n.depth() + 1);
-                check_node(s, child)
+            es.len()
+        }
+        Node::Inner(inner) => {
+            let (h, slots) = (inner.header(), inner.items());
+            assert!(d <= MAX_DEPTH);
+            assert_eq!(slots.len(), h.bitmap.count_ones() as usize);
+            assert!(!matches!(slots, [Slot::Node(Node::Leaf(_))]));
+            let p = prefix(slots[0].hash(), d);
+            let mut bits = h.bitmap;
+            let mut len = 0;
+            for slot in slots {
+                let hash = slot.hash();
+                assert_eq!(prefix(hash, d), p);
+                assert_eq!(bit(hash, d), 1 << bits.trailing_zeros());
+                bits &= bits - 1;
+                len += match slot {
+                    Slot::Entry(e) => {
+                        assert_eq!(e.hash, hash_of(s, &e.key));
+                        1
+                    }
+                    Slot::Node(c) => {
+                        assert_eq!(c.depth(), d + 1);
+                        check_node(s, c)
+                    }
+                };
             }
-        };
+            assert_eq!(len, h.len);
+            assert!(len > LEAF);
+            len
+        }
     }
-    assert_eq!(len, n.len());
-    len
 }
 
 fn depth_of<K, V>(n: &Node<K, V>) -> u8 {
-    n.slots()
-        .iter()
-        .map(|s| match s {
-            Slot::Node(c) => depth_of(c),
-            _ => n.depth(),
-        })
-        .max()
-        .unwrap_or(n.depth())
-}
-
-fn collisions_of<K, V>(n: &Node<K, V>) -> usize {
-    n.slots()
-        .iter()
-        .map(|s| match s {
-            Slot::Entry(_) => 0,
-            Slot::Collision(_) => 1,
-            Slot::Node(c) => collisions_of(c),
-        })
-        .sum()
+    match n {
+        Node::Leaf(l) => l.header().depth,
+        Node::Inner(inner) => inner
+            .items()
+            .iter()
+            .map(|s| match s {
+                Slot::Node(c) => depth_of(c),
+                Slot::Entry(_) => inner.header().depth,
+            })
+            .max()
+            .unwrap_or(inner.header().depth),
+    }
 }
 
 fn assert_matches<S: BuildHasher>(m: &Map<u64, u64, S>, model: &HashMap<u64, u64>) {
@@ -290,33 +300,45 @@ fn drops_balance() {
 
 #[test]
 fn model_deep() {
-    for seed in 0..scale(20) as u64 {
-        let m = model_test(Placed::<0>, seed, scale(5_000), placed_key::<0>);
-        assert_eq!(depth_of(m.root.as_ref().unwrap()), MAX_DEPTH);
-    }
+    let depths: Vec<u8> = (0..scale(20) as u64)
+        .map(|seed| {
+            let m = model_test(Placed::<0>, seed, scale(5_000), placed_key::<0>);
+            depth_of(m.root.as_ref().unwrap())
+        })
+        .collect();
+    assert!(depths.iter().all(|d| *d >= 8), "{depths:?}");
 }
 
 #[test]
 fn model_collisions() {
-    for seed in 0..scale(20) as u64 {
-        let m = model_test(Placed::<2>, seed, scale(5_000), placed_key::<2>);
-        let root = m.root.as_ref().unwrap();
-        assert!(collisions_of(root) > 0);
-        assert_eq!(depth_of(root), MAX_DEPTH);
-    }
+    let depths: Vec<u8> = (0..scale(20) as u64)
+        .map(|seed| {
+            let m = model_test(Placed::<2>, seed, scale(5_000), placed_key::<2>);
+            depth_of(m.root.as_ref().unwrap())
+        })
+        .collect();
+    assert!(depths.contains(&(MAX_DEPTH + 1)), "{depths:?}");
 }
 
+/// A leaf of one hash outgrows [`LEAF`]; a key of another hash splits
+/// it into an inner chain, and removing that key collapses it back.
 #[test]
-fn collision_collapses_to_entry() {
-    let mut m: Map<u64, u64, Placed<2>> = Map::default();
-    m.insert_cow(8, 0);
-    m.insert_cow(9, 1);
-    assert_eq!(collisions_of(m.root.as_ref().unwrap()), 1);
-    assert_eq!(m.remove_cow(&8), Some(0));
+fn one_hash_leaf() {
+    let mut m: Map<u64, u64, Placed<6>> = Map::default();
+    for k in 0..40 {
+        m.insert_cow(k, k);
+    }
     check(&m);
-    assert_eq!(collisions_of(m.root.as_ref().unwrap()), 0);
-    assert_eq!(m.remove_cow(&9), Some(1));
-    assert!(m.is_empty());
+    assert!(matches!(m.root, Some(Node::Leaf(_))));
+    m.insert_cow(1 << 6, 0);
+    check(&m);
+    assert_eq!(depth_of(m.root.as_ref().unwrap()), MAX_DEPTH + 1);
+    assert_eq!(m.remove_cow(&(1 << 6)), Some(0));
+    check(&m);
+    assert!(matches!(m.root, Some(Node::Leaf(_))));
+    for k in 0..40 {
+        assert_eq!(m.get(&k), Some(&k));
+    }
 }
 
 /// The shape depends on the key set alone, so any history gives the
@@ -369,8 +391,10 @@ fn update_copies_one_path() {
     let m: Map<u64, u64> = (0..scale(100_000) as u64).map(|i| (i, i)).collect();
     let (m2, _) = m.insert(7, 0);
     fn nodes(n: &Node<u64, u64>, ids: &mut HashSet<usize>) {
-        if ids.insert(n.addr()) {
-            for s in n.slots() {
+        if ids.insert(n.addr())
+            && let Node::Inner(inner) = n
+        {
+            for s in inner.items() {
                 if let Slot::Node(c) = s {
                     nodes(c, ids)
                 }
@@ -398,15 +422,21 @@ where
     if let Some(h) = memo.get(&n.identity()) {
         return h.clone();
     }
-    let slots: Vec<NewSlot<K, V>> = n
-        .slots()
-        .map(|slot| match slot {
-            SlotRef::Entry(k, v) => NewSlot::Entry(k.clone(), v.clone()),
-            SlotRef::Collision(ps) => NewSlot::Collision(ps.to_vec()),
-            SlotRef::Node(c) => NewSlot::Node(rebuild(s, c, memo)),
-        })
-        .collect();
-    let h = NodeHandle::create(s, n.depth(), slots).unwrap();
+    let h = match n.contents() {
+        Contents::Leaf(pairs) => {
+            NodeHandle::leaf(s, n.depth(), pairs.map(|(k, v)| (k.clone(), v.clone())))
+        }
+        Contents::Inner(slots) => {
+            let slots: Vec<NewSlot<K, V>> = slots
+                .map(|slot| match slot {
+                    SlotRef::Entry(k, v) => NewSlot::Entry(k.clone(), v.clone()),
+                    SlotRef::Node(c) => NewSlot::Node(rebuild(s, c, memo)),
+                })
+                .collect();
+            NodeHandle::inner(s, n.depth(), slots)
+        }
+    }
+    .unwrap();
     memo.insert(n.identity(), h.clone());
     h
 }
@@ -431,7 +461,7 @@ fn structural_round_trip() {
     let distinct = memo.len();
     let mut m0_only = HashMap::new();
     rebuild(&Placed::<2>, m0.root().unwrap(), &mut m0_only);
-    assert!(distinct < m0_only.len() + 3 * (MAX_DEPTH as usize + 1));
+    assert!(distinct < m0_only.len() + 3 * (MAX_DEPTH as usize + 2));
     for (orig, new) in [&m0, &m1, &m2].into_iter().zip(&rebuilt) {
         check(new);
         assert_eq!(orig, new);
@@ -450,31 +480,38 @@ fn structural_round_trip() {
 #[test]
 fn create_rejects() {
     let s = Placed::<2>;
-    let e = |k: u64| NewSlot::<u64, u64>::Entry(k << 2, 0);
-    let create =
-        |depth, slots: Vec<NewSlot<u64, u64>>| NodeHandle::create(&s, depth, slots);
-    assert!(create(0, vec![e(1), e(2)]).is_ok());
-    assert!(create(0, vec![e(2), e(1)]).is_err(), "out of order");
-    assert!(create(0, vec![e(1), e(1 | 32)]).is_err(), "one fragment twice");
-    assert!(create(0, vec![]).is_err(), "empty");
-    assert!(create(1, vec![e(1)]).is_err(), "lone entry below the root");
-    assert!(create(1, vec![e(1), e(1 | 32)]).is_ok());
-    assert!(create(1, vec![e(1), e(2 | 32)]).is_err(), "prefixes differ");
-    assert!(create(MAX_DEPTH + 1, vec![e(1), e(2)]).is_err(), "too deep");
-    let c = |ks: &[u64]| NewSlot::Collision(ks.iter().map(|k| (*k, 0)).collect());
-    assert!(create(0, vec![c(&[4, 5])]).is_ok());
-    assert!(create(0, vec![c(&[4])]).is_err(), "collision of one");
-    assert!(create(0, vec![c(&[4, 8])]).is_err(), "collision of two hashes");
-    assert!(create(0, vec![c(&[4, 4])]).is_err(), "collision repeats a key");
-    assert!(create(1, vec![c(&[4, 5])]).is_err(), "lone collision below the root");
-    let child = create(1, vec![e(1), e(1 | 32)]).unwrap();
-    assert!(create(0, vec![NewSlot::Node(child.clone())]).is_ok());
-    assert!(create(1, vec![NewSlot::Node(child.clone())]).is_err(), "child depth");
-    assert!(
-        create(0, vec![e(1), NewSlot::Node(child.clone())]).is_err(),
-        "one fragment twice"
-    );
-    assert!(Map::from_root(Some(child), s).is_err(), "root not at depth 0");
+    let k = |top: u64, low: u64| (top << 59 | low) << 2;
+    let leaf =
+        |depth, ks: &[u64]| NodeHandle::leaf(&s, depth, ks.iter().map(|k| (*k, 0)));
+    assert!(leaf(0, &[k(0, 1), k(0, 2)]).is_ok());
+    assert!(leaf(0, &[k(0, 2), k(0, 1)]).is_err(), "out of hash order");
+    assert!(leaf(0, &[]).is_err(), "empty");
+    assert!(leaf(1, &[k(0, 1)]).is_err(), "one pair below the root");
+    assert!(leaf(0, &[k(0, 1), k(0, 1)]).is_err(), "a key twice");
+    assert!(leaf(0, &[k(0, 1), k(0, 1) | 1]).is_ok(), "two keys of one hash");
+    assert!(leaf(1, &[k(0, 1), k(1, 1)]).is_err(), "prefixes differ");
+    assert!(leaf(MAX_DEPTH + 2, &[k(0, 1), k(0, 1) | 1]).is_err(), "too deep");
+    let many: Vec<u64> = (0..LEAF as u64 + 1).map(|i| k(0, i)).collect();
+    assert!(leaf(0, &many).is_err(), "too many hashes for a leaf");
+    let a: Vec<u64> = (0..17).map(|i| k(0, i)).collect();
+    let b: Vec<u64> = (0..17).map(|i| k(1, i)).collect();
+    let (la, lb) = (leaf(1, &a).unwrap(), leaf(1, &b).unwrap());
+    let node = |h: &NodeHandle<u64, u64>| NewSlot::Node(h.clone());
+    let inner = |depth, slots| NodeHandle::inner(&s, depth, slots);
+    assert!(inner(0, vec![node(&la), node(&lb)]).is_ok());
+    assert!(inner(0, vec![node(&la)]).is_err(), "too few pairs for an inner node");
+    assert!(inner(0, vec![node(&lb), node(&la)]).is_err(), "out of fragment order");
+    assert!(inner(1, vec![node(&la), node(&lb)]).is_err(), "child depth");
+    let entry = |k: u64| NewSlot::Entry(k, 0);
+    let dup = vec![entry(k(0, 99)), node(&la), node(&lb)];
+    assert!(inner(0, dup).is_err(), "one fragment twice");
+    assert!(inner(0, vec![node(&la), node(&lb), entry(k(2, 0))]).is_ok());
+    assert!(inner(MAX_DEPTH + 1, vec![node(&la), node(&lb)]).is_err(), "too deep");
+    assert!(Map::from_root(Some(la), s).is_err(), "root not at depth 0");
+    let s6 = Placed::<6>;
+    let one_hash = NodeHandle::leaf(&s6, 1, (0..40u64).map(|k| (k, 0))).unwrap();
+    let lone = NodeHandle::inner(&s6, 0, [NewSlot::Node(one_hash)]);
+    assert!(lone.is_err(), "a lone leaf of one hash is the node");
 }
 
 #[test]
@@ -507,4 +544,40 @@ fn string_keys_borrow() {
     assert_eq!(m.remove_cow("name42"), Some(42));
     assert!(!m.contains_key("name42"));
     check(&m);
+}
+
+/// Clones of one map, changed, snapshotted and dropped on several
+/// threads at once: shared nodes must be neither leaked nor freed early.
+#[test]
+fn threads_share() {
+    let token = std::sync::Arc::new(());
+    let base: Map<u64, std::sync::Arc<()>> =
+        (0..scale(2_000) as u64).map(|k| (k, token.clone())).collect();
+    std::thread::scope(|s| {
+        for t in 0..4 {
+            let (mut m, token) = (base.clone(), &token);
+            s.spawn(move || {
+                let mut rng = Rng(t);
+                for _ in 0..scale(2_000) {
+                    let k = rng.below(3_000);
+                    match rng.below(3) {
+                        0 => {
+                            m.insert_cow(k, token.clone());
+                        }
+                        1 => {
+                            m.remove_cow(&k);
+                        }
+                        _ => {
+                            let snap = m.clone();
+                            m.insert_cow(k + 10_000, token.clone());
+                            drop(snap)
+                        }
+                    }
+                }
+                check(&m);
+            });
+        }
+    });
+    drop(base);
+    assert_eq!(std::sync::Arc::strong_count(&token), 1);
 }

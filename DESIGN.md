@@ -26,29 +26,42 @@ prefixes. The benchmark is `examples/bench.rs`.
 
 ## Structure
 
-A hash array mapped trie (HAMT). Each level consumes 5 bits of the hash,
-low bits first. Levels 0 to 12 exist; level 12 uses the last 4 bits.
+A hash trie with two kinds of node. Inner nodes branch on 5 bits of the
+hash per level, **high bits first**, so a tree's order is its hashes'
+numeric order. Inner nodes exist at levels 0 to 12; level 12 uses the
+last 4 bits.
 
-- **Node** (`src/node.rs`): one reference-counted allocation. It holds
-  a header (count, `len` = pairs in the subtree, `depth`, a 32-bit
-  `bitmap`, `cap`) followed by room for `cap` ≤ 32 slots, one per set
-  bit, in bit order. The slot count is `bitmap.count_ones()`, so it
-  can't disagree with the bitmap.
-  - A lookup makes one dependent memory load per level.
-  - A node no other version holds gains or loses a slot in place. When
-    it's full, it moves to an allocation twice the size (up to 32).
-  - A copy of a shared node is exactly its slot count.
-- **Slot:** one of
-  - an entry `(hash, key, val)`,
-  - a collision (two or more distinct keys whose full hashes are
-    equal, behind an `Arc`),
-  - a child node.
-- **Canonical shape:** below the root, a node is never a lone entry or
-  collision. Removal collapses such a node into its parent. So a key set
-  has exactly one shape for a given hasher, whatever the insert and
-  remove history. Iteration follows the shape, so it's deterministic
-  when the hasher is. The one exception is the order of pairs inside a
-  collision.
+- **Canonical rule.** For the pairs under a slot:
+  - one pair sits inline in the parent's slot as an entry;
+  - 2 to `LEAF` (32) pairs, or any number that all share one full hash,
+    form a **leaf**: a flat node of entries sorted by hash;
+  - more than that forms an **inner** node.
+
+  The rule depends only on the key set, so a key set has exactly one
+  shape for a given hasher, whatever the insert and remove history. The
+  one exception is the order among keys with the same full hash.
+  Iteration is in hash order, so it's deterministic when the hasher is.
+  Keys with the same full hash sit side by side in a leaf, so there's no
+  separate collision type.
+- **Inner node:** a header (`len` = pairs in the subtree, `depth`, a
+  32-bit `bitmap`) and one slot per set bit, in bit order. A slot is an
+  inline entry `(hash, key, val)` or a child node.
+- **Leaf:** a header (`depth`, and `tags`: the low byte of each of the
+  first 32 hashes) and its entries. A lookup compares all 32 tags in one
+  SIMD instruction (SSE2 on x86_64, 8 at a time with integer arithmetic
+  elsewhere). That usually leaves one candidate, confirmed by its full
+  hash and key. So the lookup has no data-dependent branch until the
+  final key compare.
+- **Changes.** An insert that fills a leaf past `LEAF` rebuilds it as
+  the canonical subtree of its entries. A removal that brings an inner
+  node to `LEAF` or fewer pairs, or down to a single leaf, gathers its
+  entries into a leaf. Both move the entries when no other version
+  holds the node.
+- **Storage** (`src/node.rs`): both node kinds are one reference-counted
+  allocation holding a header and room for `cap` items. A lookup makes
+  one dependent memory load per level. A node no other version holds
+  gains or loses an item in place, moving to an allocation twice the
+  size when full. A copy of a shared node is exactly its item count.
 - **Hash mix:** the hasher's output passes through
   `h * φ64 ^ (h*φ64 >> 32)`. It spreads entropy into the bits the trie
   reads first, so a weak hasher can't make lopsided trees. It's a
@@ -65,7 +78,7 @@ low bits first. Levels 0 to 12 exist; level 12 uses the last 4 bits.
     never `RandomState::new`). It also means the same hasher version and
     build: ahash's output depends on both its version and whether the
     build uses the CPU's AES instructions.
-  - A mismatch fails safely, because `NodeHandle::create` recomputes
+  - A mismatch fails safely, because `NodeHandle::inner`/`leaf` recompute
     every hash and rejects the node. But an image written by one binary
     may not load in another, so the image format should record which
     hasher it used.
@@ -76,18 +89,21 @@ low bits first. Levels 0 to 12 exist; level 12 uses the last 4 bits.
 ## Node API
 
 `Map::root()` → `NodeRef`, which provides `identity`, `keep`, `depth`,
-`subtree_len`, and `slots` (yielding `SlotRef::{Entry, Collision, Node}`).
-Rebuilding goes through `NodeHandle::create(hasher, depth, slots)` and
-then `Map::from_root`.
+`subtree_len`, and `contents`: either `Contents::Inner` (slots,
+`SlotRef::{Entry, Node}`) or `Contents::Leaf` (pairs). Rebuilding goes
+through `NodeHandle::inner(hasher, depth, slots)` and
+`NodeHandle::leaf(hasher, depth, pairs)`, then `Map::from_root`.
 
 chunkmap's `NodeHandle::create` is `unsafe` and trusts the caller.
-imhm's is safe: it recomputes every key's hash and rejects any node the
-map couldn't have built:
-- wrong fragment order or position,
-- slots whose prefixes above the node disagree,
+imhm's constructors are safe: they recompute every key's hash and
+reject any node the map couldn't have built:
+- wrong fragment or hash order,
+- a prefix above the node that its contents don't share,
 - a child that isn't exactly one level down,
-- a bad collision,
-- a lone entry below the root,
+- a leaf of one pair below the root,
+- a leaf of more than `LEAF` pairs that don't all share one hash,
+- a repeated key,
+- an inner node of `LEAF` or fewer pairs, or of one leaf alone,
 - a root not at depth 0.
 
 A node's position in any map is determined by its contents, so a node
@@ -95,57 +111,58 @@ shared by several maps is checked once, when it's created.
 
 ## Unsafe code
 
-All of it is in `src/node.rs`, behind a safe API: `new`, `slots`,
-`make_mut`, `insert_slot`, `remove_slot`, and `NodeMut`.
+`src/node.rs`, behind a safe API: `Raw::{new, items, make_mut, insert,
+remove, take_items}` and `RawMut`.
 - **Reference counting:** the same protocol as `std::sync::Arc`
   (relaxed increment; release decrement, then an acquire fence before
-  the last owner drops the slots and frees the memory).
+  the last owner drops the items and frees the memory).
 - **Changing a node in place:** only through `&mut` while the count is
   1.
-- **Building:** a drop guard counts the slots written, so if cloning a
+- **Building:** a drop guard counts the items written, so if cloning a
   key panics partway through a copy, what was written is dropped and the
   empty node frees itself.
-- **Moving slots:** in-place insert and remove shift slots with
+- **Moving items:** in-place insert and remove shift items with
   `ptr::copy`; growing moves them to the larger allocation and frees the
-  old one without dropping them. No user code runs between a move and
-  the bitmap update that records it.
+  old one without dropping them; `take_items` moves them into a `Vec`
+  and leaves the node empty. No user code runs between a move and the
+  count update that records it.
 
-The earlier `triomphe::HeaderSlice` version of this code passed the full
-test suite under Miri. `node.rs` has not been run under Miri yet.
+`lib.rs` has one more `unsafe` block: the SSE2 tag compare. The tests
+include threads sharing, changing and dropping clones of one map.
 
-## Performance (ns/op, best of 5; imhm / imbl / chunk16)
+## Performance
 
-| keys, N | in-place insert | get | snapshot+insert | snapshot+remove |
-|---|---|---|---|---|
-| u64, 10k | 53 / 28 / 127 | 13 / 4 / 23 | 790 / 756 / 824 | 755 / 749 / 645 |
-| CompactString, 10k | 71 / 48 / 387 | 28 / 13 / 167 | 973 / 860 / 1242 | 853 / 831 / 955 |
-| ArcStr path, 10k | 56 / 40 / 385 | 17 / 8 / 145 | 874 / 869 / 1276 | 831 / 819 / 1023 |
-| u64, 100k | 69 / 48 / 202 | 18 / 9 / 66 | 1091 / 1115 / 1234 | 1056 / 1123 / 909 |
-| ArcStr path, 100k | 77 / 62 / 578 | 24 / 17 / 255 | 1192 / 1201 / 1913 | 1202 / 1206 / 1531 |
-| ArcStr path, 1M | 155 / 116 / 1286 | 103 / 67 / 1002 | 1666 / 2068 / 3945 | 1846 / 2160 / 2716 |
+Measured with `perf stat` pinned to one performance core (CPU 2), per
+operation, as the difference between two round counts so map building
+drops out; the harness is `examples/getcount.rs`. Instructions / cycles;
+"prev" is the version without leaves (`main`, 9e1235d).
 
-Against chunk16:
-- string-key lookups are 5–10× faster,
-- in-place inserts are 2–8× faster,
-- snapshot updates are even to 2× faster, except u64 removes, which are
-  about 15% slower.
+| operation | keys, N | imhm leaves | imhm prev | imbl | chunk16 |
+|---|---|---|---|---|---|
+| lookup | u64, 10k | 110 / 34 | 105 / 51 | 79 / 19 | 110 / 68 |
+| lookup | u64, 1M | 140 / 284 | 132 / 323 | 104 / 207 | 149 / 612 |
+| lookup | ArcStr, 10k | 185 / 52 | 149 / 67 | 152 / 40 | 770 / 483 |
+| lookup | ArcStr, 1M | 213 / 345 | 177 / 413 | 172 / 345 | 1136 / 3646 |
+| in-place insert | u64, 10k | 533 / 221 | 505 / 204 | 280 / 120 | 1702 / 525 |
+| in-place insert | ArcStr, 1M | 894 / 735 | 735 / 718 | 567 / 511 | 5772 / 5348 |
+| snapshot+insert | u64, 10k | 4070 / 3026 | 4320 / 3550 | 4980 / 3418 | 7005 / 3460 |
+| snapshot+insert | ArcStr, 1M | 8631 / 6490 | 7034 / 6216 | 9161 / 6741 | 14716 / 8997 |
 
-Against imbl:
-- snapshot updates are even, and faster at 1M,
-- lookups are about 1.5× slower (3× for u64 keys at 10k),
-- in-place inserts are about 1.2–1.8× slower.
+Leaves against prev:
+- **Lookups** take 15–33% fewer cycles at 10k and 1M and about the same
+  at 1k and 100k, because branch misses fall several-fold below 1M. But
+  they cost 5–24% more instructions.
+- **In-place inserts** cost 6–27% more instructions and up to 25% more
+  cycles.
+- **Snapshot inserts** are slightly cheaper at 10k–100k and cost more
+  instructions at 1M.
 
-Compared with the earlier `Vec` node, which made two dependent loads per
-level: lookups are 15–35% faster at 100k and up, and in-place inserts
-are as fast or faster.
+Against chunk16, string-key lookups take 4–7× fewer instructions and
+3–11× fewer cycles. imbl still leads on lookups and in-place inserts.
 
 ## Open decisions
 
-**Depth.** The remaining lookup gap to imbl is mostly depth. imbl 7's
-bottom nodes are flat SIMD buckets of up to 32 entries, which saves
-about a level. A canonical variant is possible: a subtree with at most
-B entries is a leaf bucket, sorted by hash, and a larger one is a trie
-node. That rule depends only on the key set, so the shape stays
-canonical. It would change the node API that `shared_map.rs` ports to,
-so it's worth doing only if environment lookups show up in a compile
-profile.
+**Keep the leaves?** They buy lookup cycles with instructions, and make
+in-place builds dearer; `main` has the version without them. The leaf
+lookup's fixed cost (tag compare, candidate mask, bounds check) is about
+15–35 instructions more than an inline entry's hash-and-key compare.

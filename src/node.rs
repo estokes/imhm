@@ -1,9 +1,8 @@
-//! The trie's node: one reference counted allocation holding a header
-//! and room for up to 32 slots, so a lookup makes one dependent load
-//! per level, and a node no other version holds gains or loses a slot
-//! in place.
+//! A reference counted allocation holding a header and room for `cap`
+//! items, the first `count` initialized. Both kinds of trie node are
+//! built on it, so a lookup makes one dependent load per level, and a
+//! node no other version holds gains or loses an item in place.
 
-use crate::{Slot, index};
 use std::{
     alloc::{self, Layout},
     marker::PhantomData,
@@ -17,115 +16,94 @@ use std::{
     },
 };
 
-/// The number of slots is `bitmap.count_ones()`; slots past it up to
-/// `cap` are uninitialized.
 #[repr(C)]
-struct Header {
+struct Head<H> {
     rc: AtomicUsize,
-    len: usize,
-    bitmap: u32,
-    depth: u8,
-    cap: u8,
+    count: u32,
+    cap: u32,
+    h: H,
 }
 
-pub(crate) struct Node<K, V> {
-    ptr: NonNull<Header>,
-    own: PhantomData<Slot<K, V>>,
+pub(crate) struct Raw<H, T> {
+    ptr: NonNull<Head<H>>,
+    own: PhantomData<(H, T)>,
 }
 
-// SAFETY: a node is shared like an `Arc<[Slot<K, V>]>`, and mutated only
+// SAFETY: a `Raw` is shared like an `Arc<(H, [T])>`, and mutated only
 // through `&mut` when its count shows no other holder.
-unsafe impl<K: Send + Sync, V: Send + Sync> Send for Node<K, V> {}
-unsafe impl<K: Send + Sync, V: Send + Sync> Sync for Node<K, V> {}
+unsafe impl<H: Send + Sync, T: Send + Sync> Send for Raw<H, T> {}
+unsafe impl<H: Send + Sync, T: Send + Sync> Sync for Raw<H, T> {}
 
-fn grown(count: usize) -> usize {
-    count.next_power_of_two().min(32)
-}
-
-impl<K, V> Node<K, V> {
+impl<H, T> Raw<H, T> {
     fn layout(cap: usize) -> (Layout, usize) {
-        let slots = Layout::array::<Slot<K, V>>(cap).expect("at most 32 slots");
-        let (l, off) = Layout::new::<Header>().extend(slots).expect("at most 32 slots");
+        let items = Layout::array::<T>(cap).expect("node size");
+        let (l, off) = Layout::new::<Head<H>>().extend(items).expect("node size");
         (l.pad_to_align(), off)
     }
 
-    fn header(&self) -> &Header {
-        // SAFETY: the header is initialized for the node's life.
+    fn head(&self) -> &Head<H> {
+        // SAFETY: the head is initialized for the node's life.
         unsafe { self.ptr.as_ref() }
     }
 
-    fn base(&self) -> *mut Slot<K, V> {
-        // SAFETY: the slots start `off` bytes into the allocation.
+    fn base(&self) -> *mut T {
+        // SAFETY: the items start `off` bytes into the allocation.
         unsafe { self.ptr.as_ptr().cast::<u8>().add(Self::layout(0).1).cast() }
     }
 
-    /// An allocation for `cap` slots holding none yet.
-    fn alloc(depth: u8, len: usize, cap: usize) -> Self {
+    fn count(&self) -> usize {
+        self.head().count as usize
+    }
+
+    fn cap(&self) -> usize {
+        self.head().cap as usize
+    }
+
+    /// An allocation for `cap` items holding none yet.
+    fn alloc(h: H, cap: usize) -> Self {
         let layout = Self::layout(cap).0;
-        // SAFETY: the layout has a nonzero size, the header's.
-        let raw = unsafe { alloc::alloc(layout) }.cast::<Header>();
+        // SAFETY: the layout has a nonzero size, the head's.
+        let raw = unsafe { alloc::alloc(layout) }.cast::<Head<H>>();
         let Some(ptr) = NonNull::new(raw) else { alloc::handle_alloc_error(layout) };
-        let header =
-            Header { rc: AtomicUsize::new(1), len, bitmap: 0, depth, cap: cap as u8 };
-        // SAFETY: freshly allocated for a header.
-        unsafe { ptr.write(header) };
+        let head = Head { rc: AtomicUsize::new(1), count: 0, cap: cap as u32, h };
+        // SAFETY: freshly allocated for a head.
+        unsafe { ptr.write(head) };
         Self { ptr, own: PhantomData }
     }
 
-    /// A node at `depth` with `len` pairs below it, room for `cap`
-    /// slots, and one of `slots` per bit of `bitmap`, in bit order.
-    pub(crate) fn new(
-        depth: u8,
-        bitmap: u32,
-        len: usize,
-        cap: usize,
-        slots: impl IntoIterator<Item = Slot<K, V>>,
-    ) -> Self {
-        let count = bitmap.count_ones() as usize;
-        assert!(count <= cap && cap <= 32);
-        let mut node = Self::alloc(depth, len, cap);
-        /// The slots written so far, dropped if `slots` unwinds; the
+    /// A node of `h` and the first `cap` of `items`, with room for `cap`.
+    pub(crate) fn new(h: H, cap: usize, items: impl IntoIterator<Item = T>) -> Self {
+        let mut node = Self::alloc(h, cap);
+        /// The items written so far, dropped if `items` unwinds; the
         /// node, still empty, then frees itself.
-        struct Written<K, V>(*mut Slot<K, V>, usize);
-        impl<K, V> Drop for Written<K, V> {
+        struct Written<T>(*mut T, usize);
+        impl<T> Drop for Written<T> {
             fn drop(&mut self) {
-                // SAFETY: the first `self.1` slots were written.
+                // SAFETY: the first `self.1` items were written.
                 unsafe {
                     ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.0, self.1))
                 }
             }
         }
         let mut written = Written(node.base(), 0);
-        for slot in slots.into_iter().take(count) {
-            // SAFETY: the node is ours alone and has room for `count`.
-            unsafe { written.0.add(written.1).write(slot) };
+        for item in items.into_iter().take(cap) {
+            // SAFETY: the node is ours alone and has room for `cap`.
+            unsafe { written.0.add(written.1).write(item) };
             written.1 += 1;
         }
-        assert_eq!(written.1, count, "a slot per bit");
+        let count = written.1 as u32;
         mem::forget(written);
-        // SAFETY: the node is ours alone, and its slots are now written.
-        unsafe { node.ptr.as_mut().bitmap = bitmap };
+        // SAFETY: the node is ours alone, and `count` items are written.
+        unsafe { node.ptr.as_mut().count = count };
         node
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.header().len
+    pub(crate) fn header(&self) -> &H {
+        &self.head().h
     }
 
-    pub(crate) fn depth(&self) -> u8 {
-        self.header().depth
-    }
-
-    pub(crate) fn bitmap(&self) -> u32 {
-        self.header().bitmap
-    }
-
-    fn count(&self) -> usize {
-        self.bitmap().count_ones() as usize
-    }
-
-    pub(crate) fn slots(&self) -> &[Slot<K, V>] {
-        // SAFETY: the first `count` slots are initialized.
+    pub(crate) fn items(&self) -> &[T] {
+        // SAFETY: the first `count` items are initialized.
         unsafe { slice::from_raw_parts(self.base(), self.count()) }
     }
 
@@ -139,175 +117,180 @@ impl<K, V> Node<K, V> {
     }
 
     fn is_unique(&self) -> bool {
-        self.header().rc.load(Acquire) == 1
-    }
-
-    /// Frees a node no other version holds, whose slots were moved out.
-    fn free_moved(self) {
-        let layout = Self::layout(self.header().cap as usize).0;
-        // SAFETY: no other handle exists and the slots were moved out.
-        unsafe { alloc::dealloc(self.ptr.as_ptr().cast(), layout) };
-        mem::forget(self)
+        self.head().rc.load(Acquire) == 1
     }
 
     /// This node to change, first copied if another version holds it.
-    pub(crate) fn make_mut(&mut self) -> NodeMut<'_, K, V>
+    pub(crate) fn make_mut(&mut self) -> RawMut<'_, H, T>
     where
-        K: Clone,
-        V: Clone,
+        H: Clone,
+        T: Clone,
     {
         if !self.is_unique() {
-            let (d, b, l) = (self.depth(), self.bitmap(), self.len());
-            *self = Self::new(d, b, l, self.count(), self.slots().iter().cloned());
+            *self = Self::new(
+                self.header().clone(),
+                self.count(),
+                self.items().iter().cloned(),
+            );
         }
-        NodeMut(self)
+        RawMut(self)
     }
 
-    /// Adds `slot` at the free fragment `bit`.
-    pub(crate) fn insert_slot(&mut self, bit: u32, slot: Slot<K, V>)
+    /// Adds `item` at `i`.
+    pub(crate) fn insert(&mut self, i: usize, item: T)
     where
-        K: Clone,
-        V: Clone,
+        H: Clone,
+        T: Clone,
     {
         if self.is_unique() {
-            return NodeMut(self).insert(bit, slot);
+            return RawMut(self).insert(i, item);
         }
-        let (b, i) = (self.bitmap(), index(self.bitmap(), bit));
-        let (l, r) = self.slots().split_at(i);
-        let len = self.len() + slot.len();
-        let slots = l.iter().cloned().chain([slot]).chain(r.iter().cloned());
-        *self = Self::new(self.depth(), b | bit, len, self.count() + 1, slots);
+        let (l, r) = self.items().split_at(i);
+        let items = l.iter().cloned().chain([item]).chain(r.iter().cloned());
+        *self = Self::new(self.header().clone(), self.count() + 1, items);
     }
 
-    /// Removes the slot at fragment `bit`.
-    pub(crate) fn remove_slot(&mut self, bit: u32) -> Slot<K, V>
+    /// Removes the item at `i`.
+    pub(crate) fn remove(&mut self, i: usize) -> T
     where
-        K: Clone,
-        V: Clone,
+        H: Clone,
+        T: Clone,
     {
         if self.is_unique() {
-            return NodeMut(self).remove(bit);
+            return RawMut(self).remove(i);
         }
-        let i = index(self.bitmap(), bit);
-        let s = self.slots();
+        let s = self.items();
         let removed = s[i].clone();
-        let slots = s[..i].iter().chain(&s[i + 1..]).cloned();
-        let len = self.len() - removed.len();
-        *self =
-            Self::new(self.depth(), self.bitmap() & !bit, len, self.count() - 1, slots);
+        let items = s[..i].iter().chain(&s[i + 1..]).cloned();
+        *self = Self::new(self.header().clone(), self.count() - 1, items);
         removed
+    }
+
+    /// The items, moved out when no other version holds the node, which
+    /// is then left empty, else cloned.
+    pub(crate) fn take_items(&mut self) -> Vec<T>
+    where
+        T: Clone,
+    {
+        if !self.is_unique() {
+            return self.items().to_vec();
+        }
+        let n = self.count();
+        let mut v = Vec::with_capacity(n);
+        // SAFETY: the node is ours alone; its items move to `v`, and its
+        // count drops to zero so they are not dropped again.
+        unsafe {
+            ptr::copy_nonoverlapping(self.base(), v.as_mut_ptr(), n);
+            self.ptr.as_mut().count = 0;
+            v.set_len(n);
+        }
+        v
     }
 }
 
-impl<K, V> Clone for Node<K, V> {
+impl<H, T> Clone for Raw<H, T> {
     fn clone(&self) -> Self {
-        if self.header().rc.fetch_add(1, Relaxed) > isize::MAX as usize {
+        if self.head().rc.fetch_add(1, Relaxed) > isize::MAX as usize {
             std::process::abort()
         }
         Self { ptr: self.ptr, own: PhantomData }
     }
 }
 
-impl<K, V> Drop for Node<K, V> {
+impl<H, T> Drop for Raw<H, T> {
     fn drop(&mut self) {
-        if self.header().rc.fetch_sub(1, Release) != 1 {
+        if self.head().rc.fetch_sub(1, Release) != 1 {
             return;
         }
         fence(Acquire);
-        let layout = Self::layout(self.header().cap as usize).0;
-        // SAFETY: this was the last handle; the first `count` slots are
-        // initialized and dropped once, then the allocation is freed.
+        let layout = Self::layout(self.cap()).0;
+        // SAFETY: this was the last handle; the head and the first
+        // `count` items are initialized and dropped once, then the
+        // allocation is freed.
         unsafe {
             ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.base(), self.count()));
+            ptr::drop_in_place(&mut (*self.ptr.as_ptr()).h);
             alloc::dealloc(self.ptr.as_ptr().cast(), layout);
         }
     }
 }
 
 /// A node no other version holds.
-pub(crate) struct NodeMut<'a, K, V>(&'a mut Node<K, V>);
+pub(crate) struct RawMut<'a, H, T>(&'a mut Raw<H, T>);
 
-impl<'a, K, V> NodeMut<'a, K, V> {
-    pub(crate) fn depth(&self) -> u8 {
-        self.0.depth()
-    }
-
-    pub(crate) fn bitmap(&self) -> u32 {
-        self.0.bitmap()
-    }
-
-    fn header_mut(&mut self) -> &mut Header {
+impl<'a, H, T> RawMut<'a, H, T> {
+    pub(crate) fn header(&mut self) -> &mut H {
         // SAFETY: no other handle exists.
-        unsafe { self.0.ptr.as_mut() }
+        unsafe { &mut self.0.ptr.as_mut().h }
     }
 
-    pub(crate) fn add_len(&mut self, n: usize) {
-        self.header_mut().len += n
-    }
-
-    pub(crate) fn sub_len(&mut self, n: usize) {
-        self.header_mut().len -= n
-    }
-
-    pub(crate) fn slots(&mut self) -> &mut [Slot<K, V>] {
-        // SAFETY: no other handle exists, and the first `count` slots
+    pub(crate) fn items(&mut self) -> &mut [T] {
+        // SAFETY: no other handle exists, and the first `count` items
         // are initialized.
         unsafe { slice::from_raw_parts_mut(self.0.base(), self.0.count()) }
     }
 
-    pub(crate) fn into_slots(self) -> &'a mut [Slot<K, V>] {
-        // SAFETY: as `slots`, for the life of the borrow.
+    pub(crate) fn parts(&mut self) -> (&mut H, &mut [T]) {
+        // SAFETY: no other handle exists; the header and the items are
+        // disjoint parts of the allocation.
+        unsafe {
+            let items = slice::from_raw_parts_mut(self.0.base(), self.0.count());
+            (&mut self.0.ptr.as_mut().h, items)
+        }
+    }
+
+    pub(crate) fn into_items(self) -> &'a mut [T] {
+        // SAFETY: as `items`, for the life of the borrow.
         unsafe { slice::from_raw_parts_mut(self.0.base(), self.0.count()) }
     }
 
-    /// Adds `slot` at the free fragment `bit`, moving the node to a
-    /// larger allocation when it is full.
-    pub(crate) fn insert(mut self, bit: u32, slot: Slot<K, V>) {
+    /// Adds `item` at `i`, moving the node to an allocation twice the
+    /// size when it is full.
+    pub(crate) fn insert(&mut self, i: usize, item: T) {
         let count = self.0.count();
-        let i = index(self.bitmap(), bit);
-        let add = slot.len();
-        if count == self.0.header().cap as usize {
-            let (d, l) = (self.depth(), self.0.len());
-            let mut new = Node::alloc(d, l, grown(count + 1));
-            // SAFETY: both nodes are ours alone. The slots move to the
-            // new node around `slot` and the old one is freed without
-            // dropping them; no code between can unwind.
+        assert!(i <= count);
+        if count == self.0.cap() {
+            let cap = (count + 1).next_power_of_two();
+            // SAFETY: both nodes are ours alone. The header and items
+            // move to the new node, leaving `i` free, and the old one is
+            // freed without dropping them; no code between can unwind.
             unsafe {
+                let h = ptr::read(&self.0.ptr.as_ref().h);
+                let mut new = Raw::<H, T>::alloc(h, cap);
                 let (src, dst) = (self.0.base(), new.base());
                 ptr::copy_nonoverlapping(src, dst, i);
                 ptr::copy_nonoverlapping(src.add(i), dst.add(i + 1), count - i);
-                new.ptr.as_mut().bitmap = self.bitmap();
+                new.ptr.as_mut().count = count as u32;
+                let old = mem::replace(self.0, new);
+                alloc::dealloc(old.ptr.as_ptr().cast(), Raw::<H, T>::layout(old.cap()).0);
+                mem::forget(old);
             }
-            mem::replace(self.0, new).free_moved();
         } else {
-            // SAFETY: the node is ours alone and has room: the slots
-            // after `i` shift up one, leaving `i` to write.
+            // SAFETY: the node is ours alone and has room: the items
+            // after `i` shift up one, leaving `i` free.
             unsafe {
                 ptr::copy(self.0.base().add(i), self.0.base().add(i + 1), count - i)
             };
         }
-        // SAFETY: slot `i` was vacated above.
-        unsafe { self.0.base().add(i).write(slot) };
-        let h = self.header_mut();
-        h.bitmap |= bit;
-        h.len += add;
+        // SAFETY: slot `i` is free; writing it makes `count + 1` items.
+        unsafe {
+            self.0.base().add(i).write(item);
+            self.0.ptr.as_mut().count += 1;
+        }
     }
 
-    /// Removes the slot at fragment `bit`.
-    pub(crate) fn remove(mut self, bit: u32) -> Slot<K, V> {
+    /// Removes the item at `i`.
+    pub(crate) fn remove(&mut self, i: usize) -> T {
         let count = self.0.count();
-        let i = index(self.bitmap(), bit);
-        // SAFETY: the node is ours alone. Slot `i` is read out and the
-        // slots after it shift down over it before the bitmap drops it.
-        let slot = unsafe {
+        assert!(i < count);
+        // SAFETY: the node is ours alone. Item `i` is read out and the
+        // items after it shift down over it as the count drops.
+        unsafe {
             let base = self.0.base();
-            let slot = base.add(i).read();
+            let item = base.add(i).read();
             ptr::copy(base.add(i + 1), base.add(i), count - i - 1);
-            slot
-        };
-        let h = self.header_mut();
-        h.bitmap &= !bit;
-        h.len -= slot.len();
-        slot
+            self.0.ptr.as_mut().count -= 1;
+            item
+        }
     }
 }
