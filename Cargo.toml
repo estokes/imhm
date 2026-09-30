@@ -9,7 +9,9 @@ rustc-hash = "2"
 triomphe = "0.1.16"
 
 [dev-dependencies]
+ahash = "0.8"
 arcstr = "1"
 compact_str = "0.9"
 imbl = "7"
 immutable-chunkmap = { version = "2.1.4", features = ["pool"] }
+nohash = "0.2"

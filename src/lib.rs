@@ -21,8 +21,11 @@ use std::{
 };
 use triomphe::Arc;
 
+mod node;
 #[cfg(test)]
 mod test;
+
+use node::Node;
 
 const BITS: u32 = 5;
 /// The deepest level. Its fragment is the hash's last 4 bits, so two
@@ -73,11 +76,13 @@ struct Collision<K, V> {
     pairs: Vec<(K, V)>,
 }
 
+/// Below the root a node is never a lone entry or collision: that
+/// lives in its parent's slot instead, so a key set has one shape.
 #[derive(Clone)]
 enum Slot<K, V> {
     Entry(Entry<K, V>),
     Collision(Arc<Collision<K, V>>),
-    Node(Arc<Node<K, V>>),
+    Node(Node<K, V>),
 }
 
 impl<K, V> Slot<K, V> {
@@ -87,7 +92,7 @@ impl<K, V> Slot<K, V> {
         match self {
             Slot::Entry(e) => e.hash,
             Slot::Collision(c) => c.hash,
-            Slot::Node(n) => n.slots[0].hash(),
+            Slot::Node(n) => n.slots()[0].hash(),
         }
     }
 
@@ -95,34 +100,9 @@ impl<K, V> Slot<K, V> {
         match self {
             Slot::Entry(_) => 1,
             Slot::Collision(c) => c.pairs.len(),
-            Slot::Node(n) => n.len,
+            Slot::Node(n) => n.len(),
         }
     }
-}
-
-/// Slots are in fragment order, one per bit of `bitmap`. Below the
-/// root a node is never a lone entry or collision: that lives in its
-/// parent's slot instead, so a key set has one shape.
-#[derive(Clone)]
-struct Node<K, V> {
-    len: usize,
-    depth: u8,
-    bitmap: u32,
-    slots: Vec<Slot<K, V>>,
-}
-
-/// The node at `depth` over `a` and `b`, whose hashes differ.
-fn join<K, V>(depth: u8, a: Slot<K, V>, b: Slot<K, V>) -> Arc<Node<K, V>> {
-    let (ba, bb) = (bit(a.hash(), depth), bit(b.hash(), depth));
-    let len = a.len() + b.len();
-    let slots = if ba == bb {
-        vec![Slot::Node(join(depth + 1, a, b))]
-    } else if ba < bb {
-        vec![a, b]
-    } else {
-        vec![b, a]
-    };
-    Arc::new(Node { len, depth, bitmap: ba | bb, slots })
 }
 
 fn find<'a, K, V, Q>(mut n: &'a Node<K, V>, hash: u64, q: &Q) -> Option<(&'a K, &'a V)>
@@ -131,11 +111,11 @@ where
     Q: Eq + ?Sized,
 {
     loop {
-        let bit = bit(hash, n.depth);
-        if n.bitmap & bit == 0 {
+        let (bit, bitmap) = (bit(hash, n.depth()), n.bitmap());
+        if bitmap & bit == 0 {
             return None;
         }
-        match &n.slots[index(n.bitmap, bit)] {
+        match &n.slots()[index(bitmap, bit)] {
             Slot::Entry(e) => {
                 return (e.hash == hash && e.key.borrow() == q)
                     .then_some((&e.key, &e.val));
@@ -153,117 +133,137 @@ where
     }
 }
 
+/// The node at `depth` over `a` and `b`, whose hashes differ.
+fn join<K, V>(depth: u8, a: Slot<K, V>, b: Slot<K, V>) -> Node<K, V> {
+    let (ba, bb) = (bit(a.hash(), depth), bit(b.hash(), depth));
+    let len = a.len() + b.len();
+    if ba == bb {
+        Node::new(depth, ba, len, 1, [Slot::Node(join(depth + 1, a, b))])
+    } else if ba < bb {
+        Node::new(depth, ba | bb, len, 2, [a, b])
+    } else {
+        Node::new(depth, ba | bb, len, 2, [b, a])
+    }
+}
+
 fn insert<K: Eq + Clone, V: Clone>(
-    node: &mut Arc<Node<K, V>>,
+    node: &mut Node<K, V>,
     hash: u64,
     key: K,
     val: V,
 ) -> Option<V> {
-    let n = Arc::make_mut(node);
-    let bit = bit(hash, n.depth);
-    let i = index(n.bitmap, bit);
-    if n.bitmap & bit == 0 {
-        n.bitmap |= bit;
-        n.slots.insert(i, Slot::Entry(Entry { hash, key, val }));
-    } else {
-        match &mut n.slots[i] {
-            Slot::Entry(e) if e.hash == hash && e.key == key => {
-                return Some(mem::replace(&mut e.val, val));
-            }
-            Slot::Collision(c) if c.hash == hash => {
-                let c = Arc::make_mut(c);
-                match c.pairs.iter_mut().find(|(k, _)| *k == key) {
-                    Some((_, v)) => return Some(mem::replace(v, val)),
-                    None => c.pairs.push((key, val)),
+    let bit = bit(hash, node.depth());
+    if node.bitmap() & bit == 0 {
+        node.insert_slot(bit, Slot::Entry(Entry { hash, key, val }));
+        return None;
+    }
+    let mut n = node.make_mut();
+    let depth = n.depth();
+    let i = index(n.bitmap(), bit);
+    match &mut n.slots()[i] {
+        Slot::Entry(e) if e.hash == hash && e.key == key => {
+            Some(mem::replace(&mut e.val, val))
+        }
+        Slot::Collision(c) if c.hash == hash => {
+            let c = Arc::make_mut(c);
+            match c.pairs.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, v)) => Some(mem::replace(v, val)),
+                None => {
+                    c.pairs.push((key, val));
+                    n.add_len(1);
+                    None
                 }
-            }
-            Slot::Node(child) => {
-                let prev = insert(child, hash, key, val);
-                if prev.is_none() {
-                    n.len += 1
-                }
-                return prev;
-            }
-            Slot::Entry(_) | Slot::Collision(_) => {
-                let slot = match n.slots.remove(i) {
-                    Slot::Entry(e) if e.hash == hash => {
-                        let pairs = vec![(e.key, e.val), (key, val)];
-                        Slot::Collision(Arc::new(Collision { hash, pairs }))
-                    }
-                    old => {
-                        let new = Slot::Entry(Entry { hash, key, val });
-                        Slot::Node(join(n.depth + 1, old, new))
-                    }
-                };
-                n.slots.insert(i, slot);
             }
         }
+        Slot::Node(child) => {
+            let prev = insert(child, hash, key, val);
+            if prev.is_none() {
+                n.add_len(1)
+            }
+            prev
+        }
+        Slot::Entry(_) | Slot::Collision(_) => {
+            let new = match n.remove(bit) {
+                Slot::Entry(e) if e.hash == hash => {
+                    let pairs = vec![(e.key, e.val), (key, val)];
+                    Slot::Collision(Arc::new(Collision { hash, pairs }))
+                }
+                old => Slot::Node(join(
+                    depth + 1,
+                    old,
+                    Slot::Entry(Entry { hash, key, val }),
+                )),
+            };
+            node.make_mut().insert(bit, new);
+            None
+        }
     }
-    n.len += 1;
-    None
 }
 
 /// Remove `q`, which must be present: a miss would copy the path for
 /// nothing.
-fn remove<K, V, Q>(node: &mut Arc<Node<K, V>>, hash: u64, q: &Q) -> Option<(K, V)>
+fn remove<K, V, Q>(node: &mut Node<K, V>, hash: u64, q: &Q) -> Option<V>
 where
     K: Borrow<Q> + Clone,
     V: Clone,
     Q: Eq + ?Sized,
 {
-    let n = Arc::make_mut(node);
-    let bit = bit(hash, n.depth);
-    if n.bitmap & bit == 0 {
+    let bit = bit(hash, node.depth());
+    if node.bitmap() & bit == 0 {
         return None;
     }
-    let i = index(n.bitmap, bit);
-    let kv = match &mut n.slots[i] {
+    let i = index(node.bitmap(), bit);
+    match &node.slots()[i] {
         Slot::Entry(e) if e.hash == hash && e.key.borrow() == q => {
-            n.bitmap &= !bit;
-            let Slot::Entry(e) = n.slots.remove(i) else { unreachable!() };
-            (e.key, e.val)
+            return match node.remove_slot(bit) {
+                Slot::Entry(e) => Some(e.val),
+                _ => None,
+            };
         }
-        Slot::Collision(c) if c.hash == hash => {
+        Slot::Entry(_) => return None,
+        Slot::Collision(c) if c.hash != hash => return None,
+        Slot::Collision(_) | Slot::Node(_) => (),
+    }
+    let mut n = node.make_mut();
+    let v = match &mut n.slots()[i] {
+        Slot::Collision(c) => {
             let c = Arc::make_mut(c);
             let j = c.pairs.iter().position(|(k, _)| k.borrow() == q)?;
-            let kv = c.pairs.swap_remove(j);
+            let (_, v) = c.pairs.swap_remove(j);
             if let [_] = c.pairs[..] {
                 let (key, val) = c.pairs.pop()?;
-                n.slots[i] = Slot::Entry(Entry { hash, key, val });
+                n.slots()[i] = Slot::Entry(Entry { hash, key, val });
             }
-            kv
+            v
         }
         Slot::Node(child) => {
-            let kv = remove(child, hash, q)?;
-            if let [Slot::Entry(_) | Slot::Collision(_)] = child.slots[..] {
-                n.slots[i] = Arc::make_mut(child).slots.pop()?;
+            let v = remove(child, hash, q)?;
+            if let [Slot::Entry(_) | Slot::Collision(_)] = child.slots() {
+                let lone = child.remove_slot(child.bitmap());
+                n.slots()[i] = lone;
             }
-            kv
+            v
         }
-        Slot::Entry(_) | Slot::Collision(_) => return None,
+        Slot::Entry(_) => return None,
     };
-    n.len -= 1;
-    Some(kv)
+    n.sub_len(1);
+    Some(v)
 }
 
 /// The value of `q`, which must be present: a miss would copy the path
 /// for nothing.
-fn get_mut<'a, K, V, Q>(
-    node: &'a mut Arc<Node<K, V>>,
-    hash: u64,
-    q: &Q,
-) -> Option<&'a mut V>
+fn get_mut<'a, K, V, Q>(node: &'a mut Node<K, V>, hash: u64, q: &Q) -> Option<&'a mut V>
 where
     K: Borrow<Q> + Clone,
     V: Clone,
     Q: Eq + ?Sized,
 {
-    let n = Arc::make_mut(node);
-    let bit = bit(hash, n.depth);
-    if n.bitmap & bit == 0 {
+    let n = node.make_mut();
+    let (bit, bitmap) = (bit(hash, n.depth()), n.bitmap());
+    if bitmap & bit == 0 {
         return None;
     }
-    match &mut n.slots[index(n.bitmap, bit)] {
+    match &mut n.into_slots()[index(bitmap, bit)] {
         Slot::Entry(e) => (e.hash == hash && e.key.borrow() == q).then_some(&mut e.val),
         Slot::Collision(c) if c.hash == hash => Arc::make_mut(c)
             .pairs
@@ -277,7 +277,7 @@ where
 
 /// A persistent hash map.
 pub struct Map<K, V, S = FxBuildHasher> {
-    root: Option<Arc<Node<K, V>>>,
+    root: Option<Node<K, V>>,
     hasher: S,
 }
 
@@ -309,7 +309,7 @@ impl<K, V, S> Map<K, V, S> {
     }
 
     pub fn len(&self) -> usize {
-        self.root.as_ref().map_or(0, |r| r.len)
+        self.root.as_ref().map_or(0, Node::len)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -330,7 +330,7 @@ impl<K, V, S> Map<K, V, S> {
     /// with a hasher that hashes like `hasher`.
     pub fn from_root(root: Option<NodeHandle<K, V>>, hasher: S) -> Result<Self> {
         if let Some(r) = &root {
-            ensure!(r.0.depth == 0, "a root is at depth 0, not {}", r.0.depth);
+            ensure!(r.0.depth() == 0, "a root is at depth 0, not {}", r.0.depth());
         }
         Ok(Self { root: root.map(|r| r.0), hasher })
     }
@@ -388,9 +388,8 @@ where
         match &mut self.root {
             Some(root) => insert(root, hash, key, val),
             None => {
-                let slots = vec![Slot::Entry(Entry { hash, key, val })];
-                let root = Node { len: 1, depth: 0, bitmap: bit(hash, 0), slots };
-                self.root = Some(Arc::new(root));
+                let slot = Slot::Entry(Entry { hash, key, val });
+                self.root = Some(Node::new(0, bit(hash, 0), 1, 1, [slot]));
                 None
             }
         }
@@ -406,8 +405,8 @@ where
         let hash = hash_of(&self.hasher, q);
         let root = self.root.as_mut()?;
         find(root, hash, q)?;
-        let (_, v) = remove(root, hash, q)?;
-        if root.slots.is_empty() {
+        let v = remove(root, hash, q)?;
+        if root.bitmap() == 0 {
             self.root = None
         }
         Some(v)
@@ -519,7 +518,7 @@ where
 {
     fn eq(&self, other: &Self) -> bool {
         match (&self.root, &other.root) {
-            (Some(a), Some(b)) if Arc::ptr_eq(a, b) => true,
+            (Some(a), Some(b)) if a.ptr_eq(b) => true,
             _ => {
                 self.len() == other.len()
                     && self.iter().all(|(k, v)| other.get(k) == Some(v))
@@ -554,13 +553,13 @@ pub struct Iter<'a, K, V> {
 }
 
 impl<'a, K, V> Iter<'a, K, V> {
-    fn new(root: Option<&'a Arc<Node<K, V>>>) -> Self {
+    fn new(root: Option<&'a Node<K, V>>) -> Self {
         let mut stack = array::from_fn(|_| [].iter());
         let (top, remaining) = match root {
             None => (0, 0),
             Some(r) => {
-                stack[0] = r.slots.iter();
-                (1, r.len)
+                stack[0] = r.slots().iter();
+                (1, r.len())
             }
         };
         Self { stack, top, collision: [].iter(), remaining }
@@ -584,7 +583,7 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
                 }
                 Some(Slot::Collision(c)) => self.collision = c.pairs.iter(),
                 Some(Slot::Node(n)) => {
-                    self.stack[self.top] = n.slots.iter();
+                    self.stack[self.top] = n.slots().iter();
                     self.top += 1;
                 }
             }
@@ -606,7 +605,7 @@ impl<K, V> FusedIterator for Iter<'_, K, V> {}
 ///
 /// [`identity`]: NodeRef::identity
 /// [`keep`]: NodeRef::keep
-pub struct NodeRef<'a, K, V>(&'a Arc<Node<K, V>>);
+pub struct NodeRef<'a, K, V>(&'a Node<K, V>);
 
 impl<K, V> Clone for NodeRef<'_, K, V> {
     fn clone(&self) -> Self {
@@ -628,7 +627,7 @@ impl<'a, K, V> NodeRef<'a, K, V> {
     /// The node's allocation address: equal for two views of one node,
     /// distinct for two nodes that are both alive.
     pub fn identity(&self) -> usize {
-        Arc::as_ptr(self.0) as usize
+        self.0.addr()
     }
 
     pub fn keep(&self) -> NodeHandle<K, V> {
@@ -637,19 +636,19 @@ impl<'a, K, V> NodeRef<'a, K, V> {
 
     /// The node's level; the root is at 0.
     pub fn depth(&self) -> u8 {
-        self.0.depth
+        self.0.depth()
     }
 
     /// The pairs in the node's subtree.
     pub fn subtree_len(&self) -> usize {
-        self.0.len
+        self.0.len()
     }
 
     pub fn slots(
         &self,
     ) -> impl ExactSizeIterator<Item = SlotRef<'a, K, V>> + use<'a, K, V> {
         let node: &'a Node<K, V> = self.0;
-        node.slots.iter().map(|s| match s {
+        node.slots().iter().map(|s| match s {
             Slot::Entry(e) => SlotRef::Entry(&e.key, &e.val),
             Slot::Collision(c) => SlotRef::Collision(&c.pairs),
             Slot::Node(n) => SlotRef::Node(NodeRef(n)),
@@ -660,7 +659,7 @@ impl<'a, K, V> NodeRef<'a, K, V> {
 /// An owned node, built by [`create`](NodeHandle::create) or kept from
 /// a [`NodeRef`]. A map is assembled from handles with
 /// [`Map::from_root`].
-pub struct NodeHandle<K, V>(Arc<Node<K, V>>);
+pub struct NodeHandle<K, V>(Node<K, V>);
 
 impl<K, V> Clone for NodeHandle<K, V> {
     fn clone(&self) -> Self {
@@ -730,7 +729,7 @@ impl<K, V> NodeHandle<K, V> {
                     Slot::Collision(Arc::new(Collision { hash, pairs }))
                 }
                 NewSlot::Node(child) => {
-                    ensure!(child.0.depth == depth + 1, "a child is one level down");
+                    ensure!(child.0.depth() == depth + 1, "a child is one level down");
                     Slot::Node(child.0)
                 }
             };
@@ -747,7 +746,8 @@ impl<K, V> NodeHandle<K, V> {
             depth == 0 || !matches!(out[..], [Slot::Entry(_) | Slot::Collision(_)]),
             "below the root a lone entry or collision lives in its parent"
         );
-        Ok(Self(Arc::new(Node { len, depth, bitmap, slots: out })))
+        let cap = out.len();
+        Ok(Self(Node::new(depth, bitmap, len, cap, out)))
     }
 }
 

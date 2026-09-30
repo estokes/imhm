@@ -71,26 +71,26 @@ fn placed_key<const SHIFT: u32>(rng: &mut Rng) -> u64 {
 
 fn check<K: Hash + Eq, V, S: BuildHasher>(m: &Map<K, V, S>) {
     if let Some(r) = &m.root {
-        assert_eq!(r.depth, 0);
-        assert!(!r.slots.is_empty());
+        assert_eq!(r.depth(), 0);
+        assert!(!r.slots().is_empty());
         check_node(&m.hasher, r);
     }
     assert_eq!(m.iter().count(), m.len());
 }
 
 fn check_node<K: Hash + Eq, V, S: BuildHasher>(s: &S, n: &Node<K, V>) -> usize {
-    assert!(n.depth <= MAX_DEPTH);
-    assert_eq!(n.slots.len(), n.bitmap.count_ones() as usize);
+    assert!(n.depth() <= MAX_DEPTH);
+    assert_eq!(n.slots().len(), n.bitmap().count_ones() as usize);
     assert!(
-        n.depth == 0 || !matches!(n.slots[..], [Slot::Entry(_) | Slot::Collision(_)])
+        n.depth() == 0 || !matches!(n.slots()[..], [Slot::Entry(_) | Slot::Collision(_)])
     );
-    let p = prefix(n.slots[0].hash(), n.depth);
-    let mut bits = n.bitmap;
+    let p = prefix(n.slots()[0].hash(), n.depth());
+    let mut bits = n.bitmap();
     let mut len = 0;
-    for slot in &n.slots {
+    for slot in n.slots() {
         let h = slot.hash();
-        assert_eq!(prefix(h, n.depth), p);
-        assert_eq!(bit(h, n.depth), 1 << bits.trailing_zeros());
+        assert_eq!(prefix(h, n.depth()), p);
+        assert_eq!(bit(h, n.depth()), 1 << bits.trailing_zeros());
         bits &= bits - 1;
         len += match slot {
             Slot::Entry(e) => {
@@ -106,28 +106,28 @@ fn check_node<K: Hash + Eq, V, S: BuildHasher>(s: &S, n: &Node<K, V>) -> usize {
                 c.pairs.len()
             }
             Slot::Node(child) => {
-                assert_eq!(child.depth, n.depth + 1);
+                assert_eq!(child.depth(), n.depth() + 1);
                 check_node(s, child)
             }
         };
     }
-    assert_eq!(len, n.len);
+    assert_eq!(len, n.len());
     len
 }
 
 fn depth_of<K, V>(n: &Node<K, V>) -> u8 {
-    n.slots
+    n.slots()
         .iter()
         .map(|s| match s {
             Slot::Node(c) => depth_of(c),
-            _ => n.depth,
+            _ => n.depth(),
         })
         .max()
-        .unwrap_or(n.depth)
+        .unwrap_or(n.depth())
 }
 
 fn collisions_of<K, V>(n: &Node<K, V>) -> usize {
-    n.slots
+    n.slots()
         .iter()
         .map(|s| match s {
             Slot::Entry(_) => 0,
@@ -149,13 +149,19 @@ fn assert_matches<S: BuildHasher>(m: &Map<u64, u64, S>, model: &HashMap<u64, u64
 
 /// Random operations against a std model, keeping snapshots that later
 /// operations must not disturb.
-fn model_test<S: BuildHasher + Clone + Default>(
+/// `n`, or a fraction of it under Miri.
+fn scale(n: usize) -> usize {
+    if cfg!(miri) { (n / 100).max(1) } else { n }
+}
+
+fn model_test<S: BuildHasher + Clone>(
+    hasher: S,
     seed: u64,
     steps: usize,
     mut key: impl FnMut(&mut Rng) -> u64,
 ) -> Map<u64, u64, S> {
     let mut rng = Rng(seed);
-    let mut m: Map<u64, u64, S> = Map::default();
+    let mut m = Map::with_hasher(hasher);
     let mut model = HashMap::new();
     let mut snaps = Vec::new();
     for step in 0..steps {
@@ -217,31 +223,83 @@ fn mix_inverts() {
 
 #[test]
 fn model_fx() {
-    for seed in 0..20 {
-        model_test::<FxBuildHasher>(seed, 5_000, |r| r.below(700));
+    for seed in 0..scale(20) as u64 {
+        model_test(FxBuildHasher, seed, scale(5_000), |r| r.below(700));
     }
-    model_test::<FxBuildHasher>(99, 100_000, |r| r.below(20_000));
+    model_test(FxBuildHasher, 99, scale(100_000), |r| r.below(20_000));
 }
 
 #[test]
 fn model_random_state() {
-    for seed in 0..5 {
-        model_test::<RandomState>(seed, 5_000, |r| r.below(700));
+    for seed in 0..scale(5) as u64 {
+        model_test(RandomState::new(), seed, scale(5_000), |r| r.below(700));
     }
 }
 
 #[test]
+fn model_nohash() {
+    for seed in 0..scale(10) as u64 {
+        let h = nohash::BuildNoHashHasher::<u64>::default();
+        model_test(h.clone(), seed, scale(5_000), |r| r.below(700));
+        model_test(h, seed, scale(5_000), |r| r.below(700) << 32);
+    }
+}
+
+#[test]
+fn model_ahash() {
+    for seed in 0..scale(10) as u64 {
+        let h = ahash::RandomState::with_seeds(seed, 1, 2, 3);
+        model_test(h, seed, scale(5_000), |r| r.below(700));
+    }
+}
+
+/// Every value is a clone of one token, so a leak or a double drop of
+/// a value shows in its count.
+#[test]
+fn drops_balance() {
+    let token = std::sync::Arc::new(());
+    {
+        let mut rng = Rng(5);
+        let mut m: Map<u64, std::sync::Arc<()>, Placed<2>> = Map::default();
+        let mut snaps = Vec::new();
+        for step in 0..scale(20_000) {
+            let k = placed_key::<2>(&mut rng);
+            match rng.below(5) {
+                0 | 1 => {
+                    m.insert_cow(k, token.clone());
+                }
+                2 => {
+                    m.remove_cow(&k);
+                }
+                3 => m = m.insert(k, token.clone()).0,
+                _ => m = m.remove(&k).0,
+            }
+            if step % 50 == 0 {
+                snaps.push(m.clone());
+                if snaps.len() > 10 {
+                    snaps.remove(0);
+                }
+            }
+        }
+        for s in &snaps {
+            check(s)
+        }
+    }
+    assert_eq!(std::sync::Arc::strong_count(&token), 1);
+}
+
+#[test]
 fn model_deep() {
-    for seed in 0..20 {
-        let m = model_test::<Placed<0>>(seed, 5_000, placed_key::<0>);
+    for seed in 0..scale(20) as u64 {
+        let m = model_test(Placed::<0>, seed, scale(5_000), placed_key::<0>);
         assert_eq!(depth_of(m.root.as_ref().unwrap()), MAX_DEPTH);
     }
 }
 
 #[test]
 fn model_collisions() {
-    for seed in 0..20 {
-        let m = model_test::<Placed<2>>(seed, 5_000, placed_key::<2>);
+    for seed in 0..scale(20) as u64 {
+        let m = model_test(Placed::<2>, seed, scale(5_000), placed_key::<2>);
         let root = m.root.as_ref().unwrap();
         assert!(collisions_of(root) > 0);
         assert_eq!(depth_of(root), MAX_DEPTH);
@@ -303,16 +361,16 @@ fn miss_copies_nothing() {
     let mut c = m.clone();
     assert_eq!(c.remove_cow(&5000), None);
     assert!(c.get_mut_cow(&5000).is_none());
-    assert!(Arc::ptr_eq(m.root.as_ref().unwrap(), c.root.as_ref().unwrap()));
+    assert!(m.root.as_ref().unwrap().ptr_eq(c.root.as_ref().unwrap()));
 }
 
 #[test]
 fn update_copies_one_path() {
-    let m: Map<u64, u64> = (0..100_000).map(|i| (i, i)).collect();
+    let m: Map<u64, u64> = (0..scale(100_000) as u64).map(|i| (i, i)).collect();
     let (m2, _) = m.insert(7, 0);
-    fn nodes(n: &Arc<Node<u64, u64>>, ids: &mut HashSet<usize>) {
-        if ids.insert(Arc::as_ptr(n) as usize) {
-            for s in &n.slots {
+    fn nodes(n: &Node<u64, u64>, ids: &mut HashSet<usize>) {
+        if ids.insert(n.addr()) {
+            for s in n.slots() {
                 if let Slot::Node(c) = s {
                     nodes(c, ids)
                 }
