@@ -90,16 +90,46 @@ fn tag_matches(tags: &[u8; LEAF], t: u8) -> u32 {
     }
 }
 
-/// Bit `i` set where `tags[i] == t`, and possibly where the tag before
-/// it matched too; a candidate is confirmed by its full hash.
-#[cfg(not(target_arch = "x86_64"))]
+/// Bit `i` set where `tags[i] == t`. Each compare lane is masked to
+/// its bit's weight, and three pairwise adds sum each run of 8 lanes
+/// into one mask byte.
+#[cfg(target_arch = "aarch64")]
 #[inline]
 fn tag_matches(tags: &[u8; LEAF], t: u8) -> u32 {
+    use std::arch::aarch64::{
+        vandq_u8, vceqq_u8, vdupq_n_u8, vgetq_lane_u32, vld1q_u8, vpaddq_u8,
+        vreinterpretq_u32_u8,
+    };
+    const WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+    // SAFETY: NEON is in the aarch64 baseline, and the loads read the
+    // 16 bytes of `WEIGHTS` and the 32 bytes of `tags`.
+    unsafe {
+        let w = vld1q_u8(WEIGHTS.as_ptr());
+        let needle = vdupq_n_u8(t);
+        let lo = vandq_u8(vceqq_u8(vld1q_u8(tags.as_ptr()), needle), w);
+        let hi = vandq_u8(vceqq_u8(vld1q_u8(tags.as_ptr().add(16)), needle), w);
+        let s = vpaddq_u8(lo, hi);
+        let s = vpaddq_u8(s, s);
+        let s = vpaddq_u8(s, s);
+        vgetq_lane_u32(vreinterpretq_u32_u8(s), 0)
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn tag_matches(tags: &[u8; LEAF], t: u8) -> u32 {
+    swar_matches(tags, t)
+}
+
+/// Bit `i` set where `tags[i] == t`, and possibly where bit `i - 1` is
+/// set and in the same 8; a candidate is confirmed by its full hash.
+#[cfg(any(test, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+fn swar_matches(tags: &[u8; LEAF], t: u8) -> u32 {
     const LO: u64 = 0x0101_0101_0101_0101;
     const HI: u64 = 0x8080_8080_8080_8080;
     let mut m = 0;
-    for (w, chunk) in tags.chunks_exact(8).enumerate() {
-        let x = u64::from_le_bytes(chunk.try_into().expect("8 bytes")) ^ (LO * t as u64);
+    for (w, chunk) in tags.as_chunks::<8>().0.iter().enumerate() {
+        let x = u64::from_le_bytes(*chunk) ^ (LO * t as u64);
         let zero = x.wrapping_sub(LO) & !x & HI;
         m |= (((zero >> 7).wrapping_mul(0x0102_0408_1020_4080) >> 56) as u32) << (8 * w);
     }

@@ -48,8 +48,9 @@ last 4 bits.
   inline entry `(hash, key, val)` or a child node.
 - **Leaf:** a header (`depth`, and `tags`: the low byte of each of the
   first 32 hashes) and its entries. A lookup compares all 32 tags in one
-  SIMD instruction (SSE2 on x86_64, 8 at a time with integer arithmetic
-  elsewhere). That usually leaves one candidate, confirmed by its full
+  few SIMD instructions (SSE2 on x86_64, NEON on aarch64, both in the
+  baseline of their architecture and on stable Rust; 8 at a time with
+  integer arithmetic elsewhere). That usually leaves one candidate, confirmed by its full
   hash and key. So the lookup has no data-dependent branch until the
   final key compare.
 - **Changes.** An insert that fills a leaf past `LEAF` rebuilds it as
@@ -127,16 +128,19 @@ remove, take_items}` and `RawMut`.
   and leaves the node empty. No user code runs between a move and the
   count update that records it.
 
-`lib.rs` has one more `unsafe` block: the SSE2 tag compare. The tests
-include threads sharing, changing and dropping clones of one map. The
-whole suite passes under Miri.
+`lib.rs` has one more `unsafe` block per architecture: the SSE2 or NEON
+tag compare. The tests include threads sharing, changing and dropping
+clones of one map. The whole suite passes under Miri on x86_64; the tag
+matcher and leaf tests pass under Miri for aarch64, and the whole suite
+passes natively on an Apple M2.
 
 ## Performance
 
 Measured with `perf stat` pinned to one performance core (CPU 2), per
 operation, as the difference between two round counts so map building
-drops out; the harness is `examples/getcount.rs`. Instructions / cycles;
-"prev" is the version without leaves (`main`, 9e1235d).
+drops out; the harness is `examples/getcount.rs`, driven by
+`scripts/count.sh` and `scripts/wall.sh`. Instructions / cycles;
+"prev" is the version without leaves (branch `no-leaves`).
 
 | operation | keys, N | imhm leaves | imhm prev | imbl | chunk16 |
 |---|---|---|---|---|---|
@@ -199,9 +203,55 @@ Leaves against prev in time:
 - **In-place inserts:** 0–24% slower.
 - **Snapshot inserts:** 5–15% faster, except for strings at 1k and 1M, where they're about 7% slower.
 
-## Open decisions
+### SIMD and target CPU (x86_64)
 
-**Keep the leaves?** They buy lookup time with instructions, and make
-in-place builds slower; `main` has the version without them. The leaf
-lookup's fixed cost (tag compare, candidate mask, bounds check) is about
-15–35 instructions more than an inline entry's hash-and-key compare.
+Lookup ns, the same method. AVX2 compares all 32 tags in one
+instruction, but it was no faster than SSE2's two compares, and choosing
+it at run time made a baseline build slightly slower than plain SSE2, so
+only SSE2 remains. The target CPU matters much more: a baseline x86-64
+build has no POPCNT, and every inner node pays for a software bit count.
+
+| keys, N | native | x86-64-v3 | x86-64-v2 | x86-64 |
+|---|---|---|---|---|
+| u64, 10k | 6.8 | 6.9 | 8.0 | 10.2 |
+| u64, 1M | 60.2 | 58.9 | 64.6 | 75.4 |
+| str, 10k | 11.0 | 10.9 | 11.5 | 14.2 |
+| str, 1M | 72.3 | 72.4 | 74.0 | 92.5 |
+
+Build for x86-64-v3 (or at least v2) where the hardware allows.
+
+### Apple M2
+
+Wall clock ns per operation, fastest of 7 (5 for inserts), not pinned.
+The portable matcher is what a target without SIMD support gets.
+
+| operation | keys, N | leaves, NEON | leaves, portable | prev | imbl |
+|---|---|---|---|---|---|
+| lookup | u64, 1k | 6.4 | 11.0 | 7.1 | 3.3 |
+| lookup | u64, 10k | 9.8 | 16.4 | 17.2 | 4.8 |
+| lookup | u64, 100k | 16.7 | 27.1 | 18.7 | 6.8 |
+| lookup | u64, 1M | 53.6 | 66.1 | 68.1 | 37.7 |
+| lookup | str, 1k | 12.2 | 17.2 | 16.7 | 8.2 |
+| lookup | str, 10k | 14.7 | 19.7 | 22.7 | 10.0 |
+| lookup | str, 100k | 22.1 | 30.5 | 24.2 | 12.8 |
+| lookup | str, 1M | 69.8 | 77.6 | 89.6 | 59.6 |
+| in-place insert | u64, 10k | 72.2 | | 67.0 | 19.8 |
+| in-place insert | u64, 1M | 167.1 | | 155.0 | 88.4 |
+| in-place insert | str, 10k | 80.7 | | 74.1 | 27.2 |
+| in-place insert | str, 1M | 189.4 | | 177.8 | 121.0 |
+| snapshot+insert | u64, 10k | 328 | | 383 | 431 |
+| snapshot+insert | u64, 1M | 713 | | 693 | 849 |
+| snapshot+insert | str, 10k | 370 | | 376 | 464 |
+| snapshot+insert | str, 1M | 856 | | 714 | 1015 |
+
+On the M2, the leaves make lookups 5–44% faster than without them.
+imbl's lead on lookups and in-place inserts is wider than on x86.
+
+## Open work
+
+**In-place inserts** are slower with leaves. The leaf lookup's fixed
+cost (tag compare, candidate mask, bounds check) is also about 15–35
+instructions more than an inline entry's hash-and-key compare.
+
+**Baseline x86-64 builds** could get POPCNT back by compiling lookup
+twice and choosing at run time, at the cost of a check per lookup.

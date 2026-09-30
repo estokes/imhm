@@ -232,6 +232,23 @@ fn mix_inverts() {
 }
 
 #[test]
+fn tag_matchers_agree() {
+    let mut rng = Rng(2);
+    for _ in 0..scale(10_000) {
+        let t = rng.next() as u8;
+        let tags: [u8; LEAF] = array::from_fn(|_| t ^ rng.below(3) as u8);
+        let exact = (0..LEAF).filter(|&i| tags[i] == t).fold(0u32, |m, i| m | 1 << i);
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        assert_eq!(tag_matches(&tags, t), exact);
+        let swar = swar_matches(&tags, t);
+        let extra = swar & !exact;
+        assert_eq!(swar & exact, exact);
+        assert_eq!(extra & 0x0101_0101, 0);
+        assert_eq!(extra & !(swar << 1), 0);
+    }
+}
+
+#[test]
 fn model_fx() {
     for seed in 0..scale(20) as u64 {
         model_test(FxBuildHasher, seed, scale(5_000), |r| r.below(700));
