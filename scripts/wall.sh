@@ -1,11 +1,11 @@
 #!/bin/bash
-# ns per op on P-core 2: the difference between the fastest of $runs runs
+# ns per op on P-core 2 at SCHED_FIFO 50: the difference between the fastest of $runs runs
 # at 3r and at r rounds, over the ops in between; the builds take turns.
 # usage: wall.sh <u64|str> <n> <get|build|snap> <runs> name=getcount-binary:kind ...
 keys=$1; n=$2; op=$3; runs=$4; shift 4
 case $op in get) per=$n; budget=20000000;; build) per=$n; budget=4000000;; *) per=100; budget=200000;; esac
 r1=$(( budget / per )); [ $r1 -lt 2 ] && r1=2; r2=$(( r1 * 3 ))
-t() { local a=$(date +%s%N); taskset -c 2 "$@" >/dev/null; echo $(( $(date +%s%N) - a )); }
+t() { local a=$(date +%s%N); taskset -c 2 chrt -f 50 "$@" >/dev/null; echo $(( $(date +%s%N) - a )); }
 declare -A lo hi
 for i in $(seq $runs); do
   for v in "$@"; do

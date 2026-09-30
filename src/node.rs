@@ -166,6 +166,36 @@ impl<H, T> Raw<H, T> {
         removed
     }
 
+    /// Adds `item` after the others.
+    pub(crate) fn push(&mut self, item: T)
+    where
+        H: Clone,
+        T: Clone,
+    {
+        if self.is_unique() {
+            return RawMut(self).push(item);
+        }
+        let items = self.items().iter().cloned().chain([item]);
+        *self = Self::new(self.header().clone(), self.count() + 1, items);
+    }
+
+    /// Removes the item at `i`, moving the last item into its place.
+    pub(crate) fn swap_remove(&mut self, i: usize) -> T
+    where
+        H: Clone,
+        T: Clone,
+    {
+        if self.is_unique() {
+            return RawMut(self).swap_remove(i);
+        }
+        let s = self.items();
+        let (last, init) = s.split_last().expect("an item to remove");
+        let removed = s[i].clone();
+        let items = init.iter().enumerate().map(|(j, x)| if j == i { last } else { x });
+        *self = Self::new(self.header().clone(), s.len() - 1, items.cloned());
+        removed
+    }
+
     /// The items, moved out when no other version holds the node, which
     /// is then left empty, else cloned.
     pub(crate) fn take_items(&mut self) -> Vec<T>
@@ -244,38 +274,69 @@ impl<'a, H, T> RawMut<'a, H, T> {
         unsafe { slice::from_raw_parts_mut(self.0.base(), self.0.count()) }
     }
 
-    /// Adds `item` at `i`, moving the node to an allocation twice the
-    /// size when it is full.
+    /// Moves the node to an allocation twice the size.
+    fn grow(&mut self) {
+        let count = self.0.count();
+        let cap = (count + 1).next_power_of_two();
+        // SAFETY: both nodes are ours alone. The header and items move to
+        // the new node, and the old one is freed without dropping them;
+        // no code between can unwind.
+        unsafe {
+            let h = ptr::read(&self.0.ptr.as_ref().h);
+            let mut new = Raw::<H, T>::alloc(h, cap);
+            ptr::copy_nonoverlapping(self.0.base(), new.base(), count);
+            new.ptr.as_mut().count = count as u32;
+            let old = mem::replace(self.0, new);
+            alloc::dealloc(old.ptr.as_ptr().cast(), Raw::<H, T>::layout(old.cap()).0);
+            mem::forget(old);
+        }
+    }
+
+    /// Adds `item` at `i`, the items from `i` moving up one.
     pub(crate) fn insert(&mut self, i: usize, item: T) {
         let count = self.0.count();
         assert!(i <= count);
         if count == self.0.cap() {
-            let cap = (count + 1).next_power_of_two();
-            // SAFETY: both nodes are ours alone. The header and items
-            // move to the new node, leaving `i` free, and the old one is
-            // freed without dropping them; no code between can unwind.
-            unsafe {
-                let h = ptr::read(&self.0.ptr.as_ref().h);
-                let mut new = Raw::<H, T>::alloc(h, cap);
-                let (src, dst) = (self.0.base(), new.base());
-                ptr::copy_nonoverlapping(src, dst, i);
-                ptr::copy_nonoverlapping(src.add(i), dst.add(i + 1), count - i);
-                new.ptr.as_mut().count = count as u32;
-                let old = mem::replace(self.0, new);
-                alloc::dealloc(old.ptr.as_ptr().cast(), Raw::<H, T>::layout(old.cap()).0);
-                mem::forget(old);
-            }
-        } else {
-            // SAFETY: the node is ours alone and has room: the items
-            // after `i` shift up one, leaving `i` free.
-            unsafe {
-                ptr::copy(self.0.base().add(i), self.0.base().add(i + 1), count - i)
-            };
+            self.grow()
         }
-        // SAFETY: slot `i` is free; writing it makes `count + 1` items.
+        // SAFETY: the node is ours alone and has room: the items from `i`
+        // shift up one, and writing the freed slot makes one more item.
         unsafe {
-            self.0.base().add(i).write(item);
+            let base = self.0.base();
+            ptr::copy(base.add(i), base.add(i + 1), count - i);
+            base.add(i).write(item);
             self.0.ptr.as_mut().count += 1;
+        }
+    }
+
+    /// Adds `item` after the others.
+    pub(crate) fn push(&mut self, item: T) {
+        let count = self.0.count();
+        if count == self.0.cap() {
+            self.grow()
+        }
+        // SAFETY: the node is ours alone and has room; writing the first
+        // free slot makes one more item.
+        unsafe {
+            self.0.base().add(count).write(item);
+            self.0.ptr.as_mut().count += 1;
+        }
+    }
+
+    /// Removes the item at `i`, moving the last item into its place.
+    pub(crate) fn swap_remove(&mut self, i: usize) -> T {
+        let count = self.0.count();
+        assert!(i < count);
+        // SAFETY: the node is ours alone. Item `i` is read out, the last
+        // item moves into its slot, and the count drops by one.
+        unsafe {
+            let base = self.0.base();
+            let item = base.add(i).read();
+            if i != count - 1 {
+                ptr::copy_nonoverlapping(base.add(count - 1), base.add(i), 1);
+            }
+            self.0.ptr.as_mut().count -= 1;
+            item
         }
     }
 

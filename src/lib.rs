@@ -12,7 +12,7 @@
 //! sharing.
 
 use anyhow::{Result, ensure};
-use node::{Raw, RawMut};
+use node::Raw;
 use rustc_hash::FxBuildHasher;
 use std::{
     array,
@@ -20,9 +20,10 @@ use std::{
     fmt,
     hash::{BuildHasher, Hash},
     iter::FusedIterator,
-    mem, slice,
+    mem, slice, vec,
 };
 
+mod lanes;
 mod node;
 #[cfg(test)]
 mod test;
@@ -34,6 +35,8 @@ const BITS: u32 = 5;
 const MAX_DEPTH: u8 = 12;
 /// The most pairs a leaf holds, unless all of them share one hash.
 pub const LEAF: usize = 32;
+/// The room a new leaf of two has.
+const PAIR_CAP: usize = 4;
 const MUL: u64 = 0x9e37_79b9_7f4a_7c15;
 
 /// Spreads the hasher's entropy over every bit the trie reads. A
@@ -71,71 +74,6 @@ fn prefix(hash: u64, depth: u8) -> u64 {
     }
 }
 
-/// Bit `i` set where `tags[i] == t`.
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn tag_matches(tags: &[u8; LEAF], t: u8) -> u32 {
-    use std::arch::x86_64::{
-        _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8,
-    };
-    // SAFETY: SSE2 is in the x86_64 baseline, and the two unaligned
-    // loads read the 32 bytes of `tags`.
-    unsafe {
-        let needle = _mm_set1_epi8(t as i8);
-        let lo = _mm_loadu_si128(tags.as_ptr().cast());
-        let hi = _mm_loadu_si128(tags.as_ptr().add(16).cast());
-        let lo = _mm_movemask_epi8(_mm_cmpeq_epi8(lo, needle)) as u32;
-        let hi = _mm_movemask_epi8(_mm_cmpeq_epi8(hi, needle)) as u32;
-        lo | hi << 16
-    }
-}
-
-/// Bit `i` set where `tags[i] == t`. Each compare lane is masked to
-/// its bit's weight, and three pairwise adds sum each run of 8 lanes
-/// into one mask byte.
-#[cfg(target_arch = "aarch64")]
-#[inline]
-fn tag_matches(tags: &[u8; LEAF], t: u8) -> u32 {
-    use std::arch::aarch64::{
-        vandq_u8, vceqq_u8, vdupq_n_u8, vgetq_lane_u32, vld1q_u8, vpaddq_u8,
-        vreinterpretq_u32_u8,
-    };
-    const WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
-    // SAFETY: NEON is in the aarch64 baseline, and the loads read the
-    // 16 bytes of `WEIGHTS` and the 32 bytes of `tags`.
-    unsafe {
-        let w = vld1q_u8(WEIGHTS.as_ptr());
-        let needle = vdupq_n_u8(t);
-        let lo = vandq_u8(vceqq_u8(vld1q_u8(tags.as_ptr()), needle), w);
-        let hi = vandq_u8(vceqq_u8(vld1q_u8(tags.as_ptr().add(16)), needle), w);
-        let s = vpaddq_u8(lo, hi);
-        let s = vpaddq_u8(s, s);
-        let s = vpaddq_u8(s, s);
-        vgetq_lane_u32(vreinterpretq_u32_u8(s), 0)
-    }
-}
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-#[inline]
-fn tag_matches(tags: &[u8; LEAF], t: u8) -> u32 {
-    swar_matches(tags, t)
-}
-
-/// Bit `i` set where `tags[i] == t`, and possibly where bit `i - 1` is
-/// set and in the same 8; a candidate is confirmed by its full hash.
-#[cfg(any(test, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
-fn swar_matches(tags: &[u8; LEAF], t: u8) -> u32 {
-    const LO: u64 = 0x0101_0101_0101_0101;
-    const HI: u64 = 0x8080_8080_8080_8080;
-    let mut m = 0;
-    for (w, chunk) in tags.as_chunks::<8>().0.iter().enumerate() {
-        let x = u64::from_le_bytes(*chunk) ^ (LO * t as u64);
-        let zero = x.wrapping_sub(LO) & !x & HI;
-        m |= (((zero >> 7).wrapping_mul(0x0102_0408_1020_4080) >> 56) as u32) << (8 * w);
-    }
-    m
-}
-
 #[derive(Clone)]
 struct Entry<K, V> {
     hash: u64,
@@ -150,20 +88,21 @@ struct InnerHead {
     depth: u8,
 }
 
-/// `tags[i]` is the low byte of entry `i`'s hash, for the first
-/// [`LEAF`] entries.
+/// For the first [`LEAF`] entries: `tags[i]` is the [`tag`] of entry
+/// `i`'s hash, and `order` lists their indices in hash order.
 #[derive(Clone, Copy)]
 struct LeafHead {
     depth: u8,
     tags: [u8; LEAF],
+    order: [u8; LEAF],
 }
 
 /// Slots are in fragment order, one per bit of `bitmap`. It holds more
 /// than [`LEAF`] pairs of at least two hashes.
 type Inner<K, V> = Raw<InnerHead, Slot<K, V>>;
 
-/// Entries in hash order: at least two below the root, and at most
-/// [`LEAF`] unless all share one hash.
+/// At least two entries below the root, and at most [`LEAF`] unless all
+/// share one hash.
 type Leaf<K, V> = Raw<LeafHead, Entry<K, V>>;
 
 enum Node<K, V> {
@@ -243,61 +182,99 @@ impl<K, V> Slot<K, V> {
     }
 }
 
+/// The byte of `hash` just below the fragments above `depth`, so a
+/// leaf's tags are in the order of its hashes.
+#[inline]
+fn tag(hash: u64, depth: u8) -> u8 {
+    hash.checked_shl(BITS * depth as u32).map_or(0, |h| (h >> 56) as u8)
+}
+
+/// Bits `0..n` for `n` at most [`LEAF`].
+#[inline]
+fn live(n: usize) -> u32 {
+    ((1u64 << n) - 1) as u32
+}
+
+/// The header of a leaf at `depth` of `entries`, in hash order.
+fn leaf_head<'a, K: 'a, V: 'a>(
+    depth: u8,
+    entries: impl IntoIterator<Item = &'a Entry<K, V>>,
+) -> LeafHead {
+    let mut tags = [0; LEAF];
+    for (t, e) in tags.iter_mut().zip(entries) {
+        *t = tag(e.hash, depth)
+    }
+    LeafHead { depth, tags, order: array::from_fn(|i| i as u8) }
+}
+
+/// The leaf at `depth` of `entries`, in hash order.
 fn leaf<K, V>(depth: u8, entries: Vec<Entry<K, V>>) -> Leaf<K, V> {
-    let mut tags = [0; LEAF];
-    for (t, e) in tags.iter_mut().zip(&entries) {
-        *t = e.hash as u8
-    }
     let cap = entries.len();
-    Raw::new(LeafHead { depth, tags }, cap, entries)
+    Raw::new(leaf_head(depth, &entries), cap, entries)
 }
 
-fn retag<K, V>(m: &mut RawMut<'_, LeafHead, Entry<K, V>>) {
-    let (h, entries) = m.parts();
-    for (t, e) in h.tags.iter_mut().zip(entries.iter()) {
-        *t = e.hash as u8
-    }
-}
-
-/// The leaf at `depth` of `a` and `b`, `a` already in the map.
+/// The leaf at `depth` of `a` and `b`.
 fn pair<K, V>(depth: u8, a: Entry<K, V>, b: Entry<K, V>) -> Leaf<K, V> {
-    let mut tags = [0; LEAF];
     let (a, b) = if b.hash < a.hash { (b, a) } else { (a, b) };
-    tags[0] = a.hash as u8;
-    tags[1] = b.hash as u8;
-    Raw::new(LeafHead { depth, tags }, 2, [a, b])
+    Raw::new(leaf_head(depth, [&a, &b]), PAIR_CAP, [a, b])
 }
 
-/// The subtree at `depth` of `entries`, at least two, in hash order.
-fn build<K, V>(depth: u8, entries: Vec<Entry<K, V>>) -> Node<K, V> {
-    let n = entries.len();
-    if n <= LEAF || entries[0].hash == entries[n - 1].hash {
-        return Node::Leaf(leaf(depth, entries));
-    }
-    let mut slots = Vec::new();
-    let mut bitmap = 0;
-    let mut rest = entries.into_iter().peekable();
-    while let Some(first) = rest.next() {
-        let b = bit(first.hash, depth);
-        let mut group = vec![first];
-        while let Some(e) = rest.next_if(|e| bit(e.hash, depth) == b) {
-            group.push(e)
+/// A leaf's entries in hash order, moved out if no other version holds
+/// it, which is left empty.
+fn sorted_items<K: Clone, V: Clone>(l: &mut Leaf<K, V>) -> Vec<Entry<K, V>> {
+    let order = l.header().order;
+    let mut v = l.take_items();
+    let mut placed = 0u64;
+    for k in 0..v.len().min(LEAF) {
+        let mut j = k;
+        while placed & 1 << j == 0 {
+            placed |= 1 << j;
+            let from = order[j] as usize;
+            if from == k {
+                break;
+            }
+            v.swap(j, from);
+            j = from;
         }
-        bitmap |= b;
-        slots.push(match <[_; 1]>::try_from(group) {
-            Ok([e]) => Slot::Entry(e),
-            Err(group) => Slot::Node(build(depth + 1, group)),
-        });
     }
-    let cap = slots.len();
-    Node::Inner(Raw::new(InnerHead { len: n, bitmap, depth }, cap, slots))
+    v
+}
+
+/// The subtree at `depth` of the next `n` of `entries`, at least two,
+/// in hash order.
+fn build<K, V>(
+    depth: u8,
+    entries: &mut vec::Drain<'_, Entry<K, V>>,
+    n: usize,
+) -> Node<K, V> {
+    let s = &entries.as_slice()[..n];
+    if n <= LEAF || s[0].hash == s[n - 1].hash {
+        let h = leaf_head(depth, s);
+        return Node::Leaf(Raw::new(h, n, entries.by_ref().take(n)));
+    }
+    let mut bitmap = 0;
+    let mut sizes = [0; 32];
+    let mut slots = 0;
+    for e in s {
+        let b = bit(e.hash, depth);
+        if bitmap & b == 0 {
+            bitmap |= b;
+            slots += 1;
+        }
+        sizes[slots - 1] += 1;
+    }
+    let items = sizes[..slots].iter().map(|&k| match k {
+        1 => Slot::Entry(entries.next().expect("a group's entry")),
+        k => Slot::Node(build(depth + 1, entries, k)),
+    });
+    Node::Inner(Raw::new(InnerHead { len: n, bitmap, depth }, slots, items))
 }
 
 /// Every entry under `node`, in hash order, moved out of the nodes no
 /// other version holds, which are left empty.
 fn drain_into<K: Clone, V: Clone>(node: &mut Node<K, V>, out: &mut Vec<Entry<K, V>>) {
     match node {
-        Node::Leaf(l) => out.extend(l.take_items()),
+        Node::Leaf(l) => out.extend(sorted_items(l)),
         Node::Inner(n) => {
             for slot in n.take_items() {
                 match slot {
@@ -316,56 +293,86 @@ fn settle<K: Clone, V: Clone>(node: &mut Node<K, V>) {
     if n.header().len > LEAF && !matches!(n.items(), [Slot::Node(Node::Leaf(_))]) {
         return;
     }
-    let depth = n.header().depth;
-    let mut entries = Vec::with_capacity(n.header().len);
+    let (depth, len) = (n.header().depth, n.header().len);
+    let mut entries = Vec::with_capacity(len);
     drain_into(node, &mut entries);
-    *node = build(depth, entries);
+    *node = build(depth, &mut entries.drain(..), len);
 }
 
+/// Whether comparing keys costs about as much as comparing hashes, so a
+/// tag match goes straight to the key.
 #[inline]
-fn leaf_index<K, V, Q>(l: &Leaf<K, V>, hash: u64, q: &Q) -> Option<usize>
+const fn cheap_eq<K>() -> bool {
+    !mem::needs_drop::<K>() && mem::size_of::<K>() <= 16
+}
+
+/// The index of `q`, whose hash is `hash` with tag `t` here.
+#[inline]
+fn leaf_index<K, V, Q>(l: &Leaf<K, V>, t: u8, hash: u64, q: &Q) -> Option<usize>
 where
     K: Borrow<Q>,
     Q: Eq + ?Sized,
 {
     let entries = l.items();
-    let n = entries.len();
-    if n > LEAF {
-        return (entries[0].hash == hash)
-            .then(|| entries.iter().position(|e| e.key.borrow() == q))
-            .flatten();
-    }
-    let mut m = tag_matches(&l.header().tags, hash as u8) & (u64::MAX >> (64 - n)) as u32;
+    let tagged = entries.len().min(LEAF);
+    let mut m = lanes::eq(&l.header().tags, t) & live(tagged);
     while m != 0 {
         let i = m.trailing_zeros() as usize;
-        let e = &entries[i];
-        if e.hash == hash && e.key.borrow() == q {
+        // SAFETY: `m` has no bit at or above `tagged`, at most the length.
+        let e = unsafe { entries.get_unchecked(i) };
+        if (cheap_eq::<K>() || e.hash == hash) && e.key.borrow() == q {
             return Some(i);
         }
         m &= m - 1;
     }
+    if entries.len() > LEAF {
+        return untagged_index(entries, hash, q);
+    }
     None
 }
 
+/// The index of `q` among the entries past the first [`LEAF`] of a leaf
+/// whose entries all share one hash.
+#[cold]
+fn untagged_index<K, V, Q>(entries: &[Entry<K, V>], hash: u64, q: &Q) -> Option<usize>
+where
+    K: Borrow<Q>,
+    Q: Eq + ?Sized,
+{
+    (entries[0].hash == hash)
+        .then(|| entries[LEAF..].iter().position(|e| e.key.borrow() == q))
+        .flatten()
+        .map(|i| i + LEAF)
+}
+
+/// `n` is a root: children are one level below their parent, so the
+/// fragment at each level is the next 5 bits of `hash`.
 #[inline]
 fn find<'a, K, V, Q>(mut n: &'a Node<K, V>, hash: u64, q: &Q) -> Option<(&'a K, &'a V)>
 where
     K: Borrow<Q>,
     Q: Eq + ?Sized,
 {
+    let mut rest = hash;
     loop {
         match n {
             Node::Leaf(l) => {
-                let e = &l.items()[leaf_index(l, hash, q)?];
+                let i = leaf_index(l, (rest >> 56) as u8, hash, q)?;
+                // SAFETY: `leaf_index` returns an index of an entry.
+                let e = unsafe { l.items().get_unchecked(i) };
                 return Some((&e.key, &e.val));
             }
             Node::Inner(inner) => {
-                let h = inner.header();
-                let bit = bit(hash, h.depth);
-                if h.bitmap & bit == 0 {
+                // `below` has the bits of fragments up to this one, which
+                // is bit 31.
+                let below = inner.header().bitmap << (!rest >> 59);
+                rest <<= BITS;
+                if (below as i32) >= 0 {
                     return None;
                 }
-                match &inner.items()[index(h.bitmap, bit)] {
+                let i = below.count_ones() as usize - 1;
+                // SAFETY: an inner node has a slot per bit of its bitmap.
+                match unsafe { inner.items().get_unchecked(i) } {
                     Slot::Entry(e) => {
                         return (e.hash == hash && e.key.borrow() == q)
                             .then_some((&e.key, &e.val));
@@ -419,21 +426,36 @@ fn insert<K: Eq + Clone, V: Clone>(
             None
         }
         Node::Leaf(l) => {
-            if let Some(i) = leaf_index(l, hash, &key) {
+            let t = tag(hash, l.header().depth);
+            if let Some(i) = leaf_index(l, t, hash, &key) {
                 return Some(mem::replace(&mut l.make_mut().items()[i].val, val));
             }
-            let entries = l.items();
+            let (entries, h) = (l.items(), l.header());
             let n = entries.len();
-            let at = entries.partition_point(|e| e.hash <= hash);
             let new = Entry { hash, key, val };
-            if n < LEAF || (entries[0].hash == hash && entries[n - 1].hash == hash) {
-                l.insert(at, new);
-                retag(&mut l.make_mut());
+            if n < LEAF {
+                let mut ties = lanes::eq(&h.tags, t) & live(n);
+                let mut rank = (lanes::below(&h.tags, t) & live(n)).count_ones() as usize;
+                while ties != 0 {
+                    rank +=
+                        (entries[ties.trailing_zeros() as usize].hash <= hash) as usize;
+                    ties &= ties - 1;
+                }
+                l.push(new);
+                let mut m = l.make_mut();
+                let h = m.header();
+                h.tags[n] = t;
+                lanes::insert(&mut h.order, rank, n as u8);
+            } else if [0, LEAF - 1].map(|k| entries[h.order[k] as usize].hash)
+                == [hash; 2]
+            {
+                l.push(new);
             } else {
-                let depth = l.header().depth;
-                let mut entries = l.take_items();
+                let depth = h.depth;
+                let mut entries = sorted_items(l);
+                let at = entries.partition_point(|e| e.hash <= hash);
                 entries.insert(at, new);
-                *node = build(depth, entries);
+                *node = build(depth, &mut entries.drain(..), n + 1);
             }
             None
         }
@@ -450,9 +472,20 @@ where
 {
     match node {
         Node::Leaf(l) => {
-            let i = leaf_index(l, hash, q)?;
-            let e = l.remove(i);
-            retag(&mut l.make_mut());
+            let i = leaf_index(l, tag(hash, l.header().depth), hash, q)?;
+            let n = l.items().len();
+            let e = l.swap_remove(i);
+            if n <= LEAF {
+                let mut m = l.make_mut();
+                let h = m.header();
+                let rank = (lanes::eq(&h.order, i as u8) & live(n)).trailing_zeros();
+                lanes::remove(&mut h.order, rank as usize);
+                if i != n - 1 {
+                    h.tags[i] = h.tags[n - 1];
+                    let moved = lanes::eq(&h.order, (n - 1) as u8) & live(n - 1);
+                    h.order[moved.trailing_zeros() as usize] = i as u8;
+                }
+            }
             Some(e.val)
         }
         Node::Inner(inner) => {
@@ -500,7 +533,7 @@ where
 {
     match node {
         Node::Leaf(l) => {
-            let i = leaf_index(l, hash, q)?;
+            let i = leaf_index(l, tag(hash, l.header().depth), hash, q)?;
             Some(&mut l.make_mut().into_items()[i].val)
         }
         Node::Inner(inner) => {
@@ -788,22 +821,59 @@ impl<'a, K, V, S> IntoIterator for &'a Map<K, V, S> {
     }
 }
 
+/// A leaf's entries in hash order.
+struct Ordered<'a, K, V> {
+    entries: &'a [Entry<K, V>],
+    order: slice::Iter<'a, u8>,
+    rest: slice::Iter<'a, Entry<K, V>>,
+}
+
+impl<'a, K, V> Ordered<'a, K, V> {
+    fn new(l: &'a Leaf<K, V>) -> Self {
+        let entries = l.items();
+        let tagged = entries.len().min(LEAF);
+        let order = l.header().order[..tagged].iter();
+        Self { entries, order, rest: entries[tagged..].iter() }
+    }
+
+    fn empty() -> Self {
+        Self { entries: &[], order: [].iter(), rest: [].iter() }
+    }
+}
+
+impl<'a, K, V> Iterator for Ordered<'a, K, V> {
+    type Item = &'a Entry<K, V>;
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a Entry<K, V>> {
+        match self.order.next() {
+            Some(&i) => Some(&self.entries[i as usize]),
+            None => self.rest.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.order.len() + self.rest.len();
+        (n, Some(n))
+    }
+}
+
 /// A walk of a tree in hash order, with a frame per inner level.
 pub struct Iter<'a, K, V> {
     stack: [slice::Iter<'a, Slot<K, V>>; MAX_DEPTH as usize + 1],
     top: usize,
-    leaf: slice::Iter<'a, Entry<K, V>>,
+    leaf: Ordered<'a, K, V>,
     remaining: usize,
 }
 
 impl<'a, K, V> Iter<'a, K, V> {
     fn new(root: Option<&'a Node<K, V>>) -> Self {
         let mut stack = array::from_fn(|_| [].iter());
-        let mut leaf = [].iter();
+        let mut leaf = Ordered::empty();
         let mut top = 0;
         match root {
             None => (),
-            Some(Node::Leaf(l)) => leaf = l.items().iter(),
+            Some(Node::Leaf(l)) => leaf = Ordered::new(l),
             Some(Node::Inner(n)) => {
                 stack[0] = n.items().iter();
                 top = 1;
@@ -829,7 +899,7 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
                     self.remaining -= 1;
                     return Some((&e.key, &e.val));
                 }
-                Some(Slot::Node(Node::Leaf(l))) => self.leaf = l.items().iter(),
+                Some(Slot::Node(Node::Leaf(l))) => self.leaf = Ordered::new(l),
                 Some(Slot::Node(Node::Inner(n))) => {
                     self.stack[self.top] = n.items().iter();
                     self.top += 1;
@@ -896,7 +966,7 @@ impl<'a, K, V> Iterator for Slots<'a, K, V> {
 
 impl<K, V> ExactSizeIterator for Slots<'_, K, V> {}
 
-pub struct Pairs<'a, K, V>(slice::Iter<'a, Entry<K, V>>);
+pub struct Pairs<'a, K, V>(Ordered<'a, K, V>);
 
 impl<'a, K, V> Iterator for Pairs<'a, K, V> {
     type Item = (&'a K, &'a V);
@@ -937,7 +1007,7 @@ impl<'a, K, V> NodeRef<'a, K, V> {
         let node: &'a Node<K, V> = self.0;
         match node {
             Node::Inner(n) => Contents::Inner(Slots(n.items().iter())),
-            Node::Leaf(n) => Contents::Leaf(Pairs(n.items().iter())),
+            Node::Leaf(n) => Contents::Leaf(Pairs(Ordered::new(n))),
         }
     }
 }

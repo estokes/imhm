@@ -85,19 +85,25 @@ fn check_node<K: Hash + Eq, V, S: BuildHasher>(s: &S, n: &Node<K, V>) -> usize {
     let d = n.depth();
     match n {
         Node::Leaf(l) => {
-            let es = l.items();
+            let (es, h) = (l.items(), l.header());
             assert!(d <= MAX_DEPTH + 1);
             assert!(es.len() >= if d > 0 { 2 } else { 1 });
-            let first = es[0].hash;
+            let tagged = es.len().min(LEAF);
+            let mut order = h.order[..tagged].to_vec();
+            order.sort();
+            assert!(order.iter().copied().eq(0..tagged as u8));
+            let sorted: Vec<_> = Ordered::new(l).collect();
+            assert_eq!(sorted.len(), es.len());
+            let first = sorted[0].hash;
             assert!(es.len() <= LEAF || es.iter().all(|e| e.hash == first));
-            for (i, e) in es.iter().enumerate() {
+            for (i, e) in sorted.iter().enumerate() {
                 assert_eq!(e.hash, hash_of(s, &e.key));
                 assert_eq!(prefix(e.hash, d), prefix(first, d));
-                assert!(i == 0 || es[i - 1].hash <= e.hash);
-                assert!(es[..i].iter().all(|p| p.key != e.key));
-                if i < LEAF {
-                    assert_eq!(l.header().tags[i], e.hash as u8)
-                }
+                assert!(i == 0 || sorted[i - 1].hash <= e.hash);
+                assert!(sorted[..i].iter().all(|p| p.key != e.key));
+            }
+            for (i, e) in es[..tagged].iter().enumerate() {
+                assert_eq!(h.tags[i], tag(e.hash, d))
             }
             es.len()
         }
@@ -232,19 +238,44 @@ fn mix_inverts() {
 }
 
 #[test]
-fn tag_matchers_agree() {
+fn lanes_agree() {
     let mut rng = Rng(2);
     for _ in 0..scale(10_000) {
         let t = rng.next() as u8;
-        let tags: [u8; LEAF] = array::from_fn(|_| t ^ rng.below(3) as u8);
-        let exact = (0..LEAF).filter(|&i| tags[i] == t).fold(0u32, |m, i| m | 1 << i);
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        assert_eq!(tag_matches(&tags, t), exact);
-        let swar = swar_matches(&tags, t);
-        let extra = swar & !exact;
-        assert_eq!(swar & exact, exact);
-        assert_eq!(extra & 0x0101_0101, 0);
-        assert_eq!(extra & !(swar << 1), 0);
+        let x: [u8; LEAF] =
+            array::from_fn(|_| t.wrapping_add(rng.below(5) as u8).wrapping_sub(2));
+        let (i, v) = (rng.below(LEAF as u64) as usize, rng.next() as u8);
+        let eq = (0..LEAF).filter(|&i| x[i] == t).fold(0u32, |m, i| m | 1 << i);
+        let below = (0..LEAF).filter(|&i| x[i] < t).fold(0u32, |m, i| m | 1 << i);
+        let mut inserted = x.to_vec();
+        inserted.insert(i, v);
+        inserted.pop();
+        let mut removed = x.to_vec();
+        removed.remove(i);
+        removed.push(0);
+        for (eq_fn, below_fn, insert_fn, remove_fn) in [
+            (
+                lanes::eq as fn(&_, _) -> _,
+                lanes::below as fn(&_, _) -> _,
+                lanes::insert as fn(&mut _, _, _),
+                lanes::remove as fn(&mut _, _),
+            ),
+            (
+                lanes::scalar_eq,
+                lanes::scalar_below,
+                lanes::scalar_insert,
+                lanes::scalar_remove,
+            ),
+        ] {
+            assert_eq!(eq_fn(&x, t), eq);
+            assert_eq!(below_fn(&x, t), below);
+            let mut y = x;
+            insert_fn(&mut y, i, v);
+            assert_eq!(y[..], inserted[..]);
+            let mut y = x;
+            remove_fn(&mut y, i);
+            assert_eq!(y[..], removed[..]);
+        }
     }
 }
 
