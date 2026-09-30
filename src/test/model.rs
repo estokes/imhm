@@ -224,8 +224,12 @@ fn shape<K, V>(m: &Map<K, V, impl BuildHasher>) -> Vec<(u8, u8, u64)> {
     out
 }
 
+/// What a version should hold. Its hasher is fixed, so the keys it
+/// picks and the order it lists them in replay with the seed.
+type Model<K, V> = HashMap<K, V, FxBuildHasher>;
+
 /// Everything a version must agree with its model on.
-fn agree<K, V, S>(m: &Map<K, V, S>, model: &HashMap<K, V>)
+fn agree<K, V, S>(m: &Map<K, V, S>, model: &Model<K, V>)
 where
     K: Hash + Eq + Debug,
     V: Eq + Debug,
@@ -249,7 +253,7 @@ where
 /// The same key set built in another order, and the same tree rebuilt
 /// through the node API, are the same map with the same shape and
 /// iteration order.
-fn canonical<K, V, S>(r: &mut Rng, m: &Map<K, V, S>, model: &HashMap<K, V>)
+fn canonical<K, V, S>(r: &mut Rng, m: &Map<K, V, S>, model: &Model<K, V>)
 where
     K: Hash + Eq + Clone + Debug,
     V: Eq + Clone + Debug,
@@ -292,7 +296,7 @@ where
         let pool: Vec<K> = (0..2 * size).map(|_| K::random(r)).collect();
         let key = |r: &mut Rng| pool[r.below(pool.len() as u64) as usize].clone();
         let mut versions =
-            vec![(Map::<K, V, S>::with_hasher(hasher.clone()), HashMap::<K, V>::new())];
+            vec![(Map::<K, V, S>::with_hasher(hasher.clone()), Model::<K, V>::default())];
         let steps = 6 * size + 50;
         // A fork copies its model, so a large map forks less often.
         let fork_every = (size / 2000).max(1) as u64;
@@ -587,64 +591,165 @@ fn sets() {
 }
 
 thread_local! {
-    /// Clones left before a `Bomb` panics, when positive.
-    static FUSE: Cell<usize> = const { Cell::new(0) };
+    /// Clones and drops of `Fragile` left before one panics, when
+    /// positive.
+    static FUSE: Cell<u64> = const { Cell::new(0) };
 }
 
-/// A value whose clone panics when the fuse runs out.
-#[derive(Debug, PartialEq, Eq)]
-struct Bomb(Tracked);
-
-impl Clone for Bomb {
-    fn clone(&self) -> Self {
-        let fuse = FUSE.with(Cell::get);
+/// Burns one unit of the fuse, panicking on the last, unless already
+/// unwinding: a second panic would abort.
+fn burn() {
+    let fuse = FUSE.with(Cell::get);
+    if fuse > 0 && !std::thread::panicking() {
+        FUSE.with(|f| f.set(fuse - 1));
         if fuse == 1 {
-            FUSE.with(|f| f.set(0));
             panic!("fuse")
         }
-        FUSE.with(|f| f.set(fuse.saturating_sub(1)));
-        Bomb(self.0.clone())
     }
 }
 
-/// A clone that panics partway through copying a path leaves every
-/// version whole and drops each half-built copy exactly once.
+/// A key or value whose clone or drop panics when the fuse runs out.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Fragile(Tracked);
+
+impl Fragile {
+    fn id(&self) -> u64 {
+        *self.0.0
+    }
+}
+
+impl Clone for Fragile {
+    fn clone(&self) -> Self {
+        burn();
+        Fragile(self.0.clone())
+    }
+}
+
+impl Drop for Fragile {
+    fn drop(&mut self) {
+        burn()
+    }
+}
+
+/// The pairs of `m` by id, touching no clone or drop.
+fn ids<S>(m: &Map<Fragile, Fragile, S>) -> HashMap<u64, u64> {
+    m.iter().map(|(k, v)| (k.id(), v.id())).collect()
+}
+
+/// Random operations on several versions of a map whose keys and
+/// values panic in clone or drop at random points. A panicking operation
+/// leaves its map whole, holding what it held before or after, and
+/// every other version untouched.
+fn fragile<S: BuildHasher + Clone>(hasher: S, size: usize, seed: u64) {
+    let live = LIVE.with(Cell::get);
+    {
+        let r = &mut Rng(seed);
+        let mut versions = vec![(Map::with_hasher(hasher), HashMap::new())];
+        let mut panics = 0;
+        for step in 0..8 * size + 50 {
+            let i = r.below(versions.len() as u64) as usize;
+            let (k, v) = (r.below(2 * size as u64), r.next());
+            let (key, val) = (Fragile(Tracked::new(k)), Fragile(Tracked::new(v)));
+            let op = r.below(7);
+            let before: HashMap<u64, u64> = versions[i].1.clone();
+            let mut after = before.clone();
+            match op {
+                0 | 2 => drop(after.insert(k, v)),
+                1 | 3 => drop(after.remove(&k)),
+                4 => {
+                    if let Some(x) = after.get_mut(&k) {
+                        *x = v
+                    }
+                }
+                _ => drop(after.entry(k).or_insert(v)),
+            }
+            let m = &mut versions[i].0;
+            if r.below(2) == 0 {
+                FUSE.with(|f| f.set(1 + r.below(20)));
+            }
+            // Whatever a closure still owns is dropped only as it returns;
+            // a destructor that panics then would leak the return value
+            // (rust-lang/rust#47949), so each arm drops its own.
+            let result = panic::catch_unwind(AssertUnwindSafe(|| match op {
+                0 => {
+                    drop(m.insert_cow(key, val));
+                    None
+                }
+                1 => {
+                    drop(m.remove_cow(&key));
+                    None
+                }
+                2 => {
+                    let (fork, prev) = m.insert(key, val);
+                    drop(prev);
+                    Some(fork)
+                }
+                3 => {
+                    let (fork, prev) = m.remove(&key);
+                    drop((prev, key, val));
+                    Some(fork)
+                }
+                4 => {
+                    if let Some(x) = m.get_mut_cow(&key) {
+                        *x = val
+                    }
+                    None
+                }
+                _ => {
+                    m.get_or_insert_cow(key, || val);
+                    None
+                }
+            }));
+            FUSE.with(|f| f.set(0));
+            let now = ids(m);
+            match result {
+                Ok(fork) => {
+                    if let Some(fork) = fork {
+                        assert_eq!(now, before, "a new version leaves the old one");
+                        check(&fork);
+                        assert_eq!(ids(&fork), after);
+                        versions.push((fork, after));
+                    } else {
+                        assert_eq!(now, after);
+                        versions[i].1 = after;
+                    }
+                }
+                Err(_) => {
+                    panics += 1;
+                    assert!(now == before || now == after, "whole before or after");
+                    check(m);
+                    versions[i].1 = now;
+                }
+            }
+            if versions.len() > 8 {
+                versions.remove(r.below(8) as usize);
+            }
+            if step % (size / 4 + 10) == 0 {
+                for (m, model) in &versions {
+                    check(m);
+                    assert_eq!(&ids(m), model);
+                }
+            }
+        }
+        assert!(panics > 0);
+    }
+    assert_eq!(LIVE.with(Cell::get), live, "every Tracked is dropped once");
+}
+
 #[test]
-fn clone_panics() {
+fn panics() {
     let seed = seed();
     let _replay = Replay(seed);
     let r = &mut Rng(seed);
-    let live = LIVE.with(Cell::get);
-    {
-        let n = budget(20_000);
-        let mut m: Map<u64, Bomb, _> = Map::with_hasher(Deep::<12>);
-        let mut model = HashMap::new();
-        for _ in 0..n {
-            let (k, id) = (r.below(2 * n as u64), r.next());
-            m.insert_cow(k, Bomb(Tracked::new(id)));
-            model.insert(k, id);
+    let hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        if info.payload().downcast_ref::<&str>() != Some(&"fuse") {
+            hook(info)
         }
-        let hook = panic::take_hook();
-        panic::set_hook(Box::new(|_| ()));
-        for _ in 0..budget(2_000) {
-            let snap = m.clone();
-            let k = r.below(2 * n as u64);
-            FUSE.with(|f| f.set(1 + r.below(40) as usize));
-            let mut copy = m.clone();
-            let result = panic::catch_unwind(AssertUnwindSafe(|| match r.below(3) {
-                0 => drop(copy.insert_cow(k, Bomb(Tracked::new(0)))),
-                1 => drop(copy.remove_cow(&k)),
-                _ => drop(copy.get_mut_cow(&k)),
-            }));
-            FUSE.with(|f| f.set(0));
-            if result.is_err() {
-                drop(copy);
-            }
-            assert!(snap.iter().all(|(k, v)| model.get(k) == Some(&*v.0.0)));
-            assert_eq!(snap.len(), model.len());
-            check(&m);
-        }
-        panic::set_hook(hook);
+    }));
+    for &n in &[33, 200, budget(2_000)] {
+        fragile(FxBuildHasher, n, r.next());
+        fragile(Deep::<12>, n, r.next());
+        fragile(Few::<3>, n, r.next());
     }
-    assert_eq!(LIVE.with(Cell::get), live);
 }

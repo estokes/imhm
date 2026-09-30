@@ -434,7 +434,7 @@ fn insert<K: Eq + Clone, V: Clone>(
                     None
                 }
                 Slot::Entry(e) if e.hash == hash && e.key == key => {
-                    return Some(mem::replace(&mut e.val, val));
+                    return without(key, mem::replace(&mut e.val, val));
                 }
                 Slot::Entry(_) => {
                     let Slot::Entry(old) = mem::replace(slot, Slot::Empty) else {
@@ -455,7 +455,7 @@ fn insert<K: Eq + Clone, V: Clone>(
             let t = tag(hash, l.header().depth);
             let same = same_tag(l, t);
             if let Some(i) = leaf_match(l.items(), same, hash, &key) {
-                return Some(mem::replace(&mut l.make_mut().items()[i].val, val));
+                return without(key, mem::replace(&mut l.make_mut().items()[i].val, val));
             }
             let (entries, h) = (l.items(), l.header());
             let n = entries.len();
@@ -487,9 +487,43 @@ fn insert<K: Eq + Clone, V: Clone>(
     }
 }
 
+/// `val`, once `key` is dropped: a destructor that panics while a
+/// function returns leaks the return value (rust-lang/rust#47949).
+fn without<K, V>(key: K, val: V) -> Option<V> {
+    drop(key);
+    Some(val)
+}
+
+/// Makes every node under `node` one no other version holds, copying
+/// those shared, so taking the subtree apart runs no user code.
+fn unshare<K: Clone, V: Clone>(node: &mut Node<K, V>) {
+    match node {
+        Node::Leaf(l) => drop(l.make_mut()),
+        Node::Inner(n) => {
+            for slot in n.make_mut().into_items() {
+                if let Slot::Node(c) = slot {
+                    unshare(c)
+                }
+            }
+        }
+    }
+}
+
+/// Whether removing the key in slot `f` collapses `n` into a leaf.
+fn collapses<K, V>(n: &Inner<K, V>, f: usize) -> bool {
+    let (h, s) = (n.header(), slots(n));
+    let other = (h.bitmap & !(1 << f)).trailing_zeros() as usize;
+    h.len - 1 <= LEAF
+        || (h.bitmap.count_ones() == 2
+            && matches!(s[f], Slot::Entry(_))
+            && matches!(s.get(other), Some(Slot::Node(Node::Leaf(_)))))
+}
+
 /// Remove `q`, which must be present: a miss would copy the path for
-/// nothing.
-fn remove<K, V, Q>(node: &mut Node<K, V>, hash: u64, q: &Q) -> Option<V>
+/// nothing. The entry is returned whole, so its key is dropped only once
+/// the tree is whole again. Every copy is made before anything moves,
+/// so a panicking clone leaves the map as it was.
+fn remove<K, V, Q>(node: &mut Node<K, V>, hash: u64, q: &Q) -> Option<Entry<K, V>>
 where
     K: Borrow<Q> + Clone,
     V: Clone,
@@ -512,13 +546,17 @@ where
                     h.order[moved.expect("each entry has a rank")] = i as u8;
                 }
             }
-            Some(e.val)
+            Some(e)
         }
         Node::Inner(inner) => {
             let f = frag(hash, inner.header().depth);
             if matches!(slots(inner)[f], Slot::Empty) {
                 return None;
             }
+            if collapses(inner, f) {
+                unshare(node);
+            }
+            let Node::Inner(inner) = node else { unreachable!("still inner") };
             let mut m = inner.make_mut();
             let (h, slots) = m.parts();
             let slot = &mut slots[f];
@@ -528,11 +566,11 @@ where
                         unreachable!("an entry, matched above")
                     };
                     h.bitmap &= !(1 << f);
-                    e.val
+                    e
                 }
                 Slot::Empty | Slot::Entry(_) => return None,
                 Slot::Node(child) => {
-                    let v = remove(child, hash, q)?;
+                    let e = remove(child, hash, q)?;
                     match child {
                         Node::Leaf(l) if l.items().len() == 1 => {
                             let e = l.swap_remove(0);
@@ -540,7 +578,7 @@ where
                         }
                         _ => settle(child),
                     }
-                    v
+                    e
                 }
             };
             h.len -= 1;
@@ -614,6 +652,15 @@ impl<K, V, S> Map<K, V, S> {
 
     pub fn is_empty(&self) -> bool {
         self.root.is_none()
+    }
+
+    /// Whether the two share their whole tree, so they hold the same
+    /// pairs without comparing any; false says nothing.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        match (&self.root, &other.root) {
+            (Some(a), Some(b)) => a.ptr_eq(b),
+            (a, b) => a.is_none() && b.is_none(),
+        }
     }
 
     /// The pairs in hash order.
@@ -704,12 +751,12 @@ where
         let hash = hash_of(&self.hasher, q);
         let root = self.root.as_mut()?;
         find(root, hash, q)?;
-        let v = remove(root, hash, q)?;
+        let e = remove(root, hash, q)?;
         match root.len() {
             0 => self.root = None,
             _ => settle(root),
         }
-        Some(v)
+        without(e.key, e.val)
     }
 
     /// The value of `q` to change in place, copying only the parts of
@@ -817,13 +864,7 @@ where
     S: BuildHasher,
 {
     fn eq(&self, other: &Self) -> bool {
-        match (&self.root, &other.root) {
-            (Some(a), Some(b)) if a.ptr_eq(b) => true,
-            _ => {
-                self.len() == other.len()
-                    && self.iter().all(|(k, v)| other.get(k) == Some(v))
-            }
-        }
+        self.len() == other.len() && self.iter().all(|(k, v)| other.get(k) == Some(v))
     }
 }
 
@@ -1215,6 +1256,11 @@ impl<K, S> Set<K, S> {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Whether the two share their whole tree, as [`Map::ptr_eq`].
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        self.0.ptr_eq(&other.0)
     }
 
     /// The members in hash order.

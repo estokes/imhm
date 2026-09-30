@@ -124,6 +124,20 @@ reject any node the map couldn't have built:
 A node's position in any map is determined by its contents, so a node
 shared by several maps is checked once, when it's created.
 
+## Panics
+
+If a key's or value's `Clone` or `Drop` panics during an operation, the
+map stays whole: its invariants hold, it holds what it held before or
+after the operation, other versions are untouched, and nothing leaks.
+- **Copies before moves.** A change copies each shared node it needs
+  before it moves anything. A removal that will collapse a subtree
+  first copies every shared node in it (`unshare`), so the collapse
+  only moves entries.
+- **Drops last.** A removed key, and a key made redundant by an insert,
+  is dropped only once the tree is whole again, and before the return
+  value exists: a destructor that panics while a function returns leaks
+  that value (rust-lang/rust#47949).
+
 ## Unsafe code
 
 `src/node.rs`, behind a safe API: `Raw::{new, items, make_mut, push,
@@ -136,6 +150,9 @@ swap_remove, take_items}` and `RawMut`.
 - **Building:** a drop guard counts the items written, so if cloning a
   key panics partway through a copy, what was written is dropped and the
   empty node frees itself.
+- **Dropping:** a guard frees the allocation even if an item's drop
+  panics. Capacity is checked to fit the header's `u32` before
+  allocating.
 - **Moving items:** `swap_remove` moves the last item into the hole;
   growing moves the items to a larger allocation and frees the old one
   without dropping them; `take_items` moves them into a `Vec` and
@@ -173,8 +190,11 @@ references.
   in a shuffled order (same shape, same iteration order) and the same
   tree rebuilt through the node API. Then the last version is emptied
   in hash order, which passes through every kind of collapse.
-- **Also:** a set model, and a clone that panics partway through a path
-  copy (every version intact, nothing leaked).
+- **Also:** a set model, and a panic model: keys and values whose
+  `Clone` or `Drop` panics at a random point in any operation. After
+  each panic the map must pass the invariant check and hold exactly
+  what it held before or after the operation, other versions must be
+  untouched, and nothing may leak.
 - **Seeds:** random per run; a failure prints `IMHM_SEED` to replay it.
 - **Speed:** full size in release (2–4 minutes on 16 threads), a
   tenth in debug, a hundredth under Miri, which skips the 500k runs.

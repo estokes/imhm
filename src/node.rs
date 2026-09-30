@@ -61,11 +61,12 @@ impl<H, T> Raw<H, T> {
 
     /// An allocation for `cap` items holding none yet.
     fn alloc(h: H, cap: usize) -> Self {
+        let cap32 = u32::try_from(cap).expect("a node holds fewer than 2^32 items");
         let layout = Self::layout(cap).0;
         // SAFETY: the layout has a nonzero size, the head's.
         let raw = unsafe { alloc::alloc(layout) }.cast::<Head<H>>();
         let Some(ptr) = NonNull::new(raw) else { alloc::handle_alloc_error(layout) };
-        let head = Head { rc: AtomicUsize::new(1), count: 0, cap: cap as u32, h };
+        let head = Head { rc: AtomicUsize::new(1), count: 0, cap: cap32, h };
         // SAFETY: freshly allocated for a head.
         unsafe { ptr.write(head) };
         Self { ptr, own: PhantomData }
@@ -218,14 +219,24 @@ impl<H, T> Drop for Raw<H, T> {
             return;
         }
         fence(Acquire);
-        let layout = Self::layout(self.cap()).0;
-        // SAFETY: this was the last handle; the head and the first
-        // `count` items are initialized and dropped once, then the
-        // allocation is freed.
+        /// Drops the head and frees the allocation, even when dropping
+        /// an item panics.
+        struct Free<H>(NonNull<Head<H>>, Layout);
+        impl<H> Drop for Free<H> {
+            fn drop(&mut self) {
+                // SAFETY: the head is initialized and dropped once, and
+                // the allocation has this layout.
+                unsafe {
+                    ptr::drop_in_place(&mut (*self.0.as_ptr()).h);
+                    alloc::dealloc(self.0.as_ptr().cast(), self.1);
+                }
+            }
+        }
+        let _free = Free(self.ptr, Self::layout(self.cap()).0);
+        // SAFETY: this was the last handle; the first `count` items are
+        // initialized and dropped once.
         unsafe {
-            ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.base(), self.count()));
-            ptr::drop_in_place(&mut (*self.ptr.as_ptr()).h);
-            alloc::dealloc(self.ptr.as_ptr().cast(), layout);
+            ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.base(), self.count()))
         }
     }
 }
