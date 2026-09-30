@@ -149,6 +149,45 @@ of one map. The whole suite passes under Miri on x86_64; the lane and
 leaf tests pass under Miri for aarch64, RISC-V and s390x (big-endian),
 and the whole suite passes natively on an Apple M2.
 
+## Testing
+
+`src/test.rs` has hand-built cases: hashers that place keys at chosen
+points of the tree (deep chains, full-hash collisions), shape,
+sharing, the node API, threads, and the lane operations against plain
+references.
+
+`src/test/model.rs` is the model checker:
+- **What varies:**
+  - Types: integers, random `ArcStr` and `CompactString` (empty,
+    inline, heap, any Unicode), pairs, maps as values, and `Tracked`,
+    which counts itself so every clone is shown dropped exactly once.
+  - Hashers: Fx, ahash, nohash, and three hostile ones: `Deep` shares
+    all but 12 bits (deep chains), `Few<6>` and `Few<3>` allow 64 or 8
+    distinct hashes, and `Few<0>` gives every key one hash.
+  - Sizes: 1, 2, the edges of a leaf, up to 20k, and 500k in three runs.
+- **Each run:** up to 8 versions, each with a `HashMap` of what it
+  should hold. The run grows, churns and shrinks, with every mutating
+  call made both in place and on old versions. The touched version's
+  invariants are checked every `size/32` steps and all versions every
+  `size/2`. At the end, each version must equal the same key set built
+  in a shuffled order (same shape, same iteration order) and the same
+  tree rebuilt through the node API. Then the last version is emptied
+  in hash order, which passes through every kind of collapse.
+- **Also:** a set model, and a clone that panics partway through a path
+  copy (every version intact, nothing leaked).
+- **Seeds:** random per run; a failure prints `IMHM_SEED` to replay it.
+- **Speed:** full size in release (2–4 minutes on 16 threads), a
+  tenth in debug, a hundredth under Miri, which skips the 500k runs.
+
+To check that the suite finds bugs, ten plausible ones were planted
+one at a time, and it caught all ten. For example: a stale tag or
+`order` lane, a lost `len` update, a missing collapse, a shared node
+changed in place, a split that ignores `order`.
+
+Miri reports leaks as well as undefined behavior. `scripts/valgrind.sh`
+runs every test natively under memcheck, at a tenth of full size, with
+definite and indirect leaks as errors.
+
 ## Performance
 
 ns per operation, wall clock: `examples/getcount.rs`, driven by

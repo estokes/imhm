@@ -1,4 +1,6 @@
 use super::*;
+
+mod model;
 use std::{
     collections::{HashMap, HashSet, hash_map::RandomState},
     hash::Hasher,
