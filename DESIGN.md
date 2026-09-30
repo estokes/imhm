@@ -211,7 +211,9 @@ one at a time, and it caught all ten. For example: a stale tag or
 `order` lane, a lost `len` update, a missing collapse, a shared node
 changed in place, a split that ignores `order`.
 
-Miri reports leaks as well as undefined behavior. `scripts/valgrind.sh`
+Miri reports leaks as well as undefined behavior. `scripts/miri.sh`
+runs every test under Miri, each in its own process, in parallel.
+`scripts/valgrind.sh`
 runs every test natively under memcheck, at a tenth of full size, with
 definite and indirect leaks as errors.
 
