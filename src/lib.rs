@@ -13,7 +13,7 @@
 
 use anyhow::{Result, ensure};
 use node::Raw;
-use rustc_hash::FxBuildHasher;
+pub use rustc_hash::FxBuildHasher;
 use std::{
     array,
     borrow::Borrow,
