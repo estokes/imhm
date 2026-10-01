@@ -2,6 +2,14 @@
 name = "imhm"
 version = "0.1.0"
 edition = "2024"
+authors = ["Eric Stokes <eestokes@pm.me>"]
+publish = true
+description = "A fast immutable hashmap"
+categories = ["data-structures"]
+keywords = ["map", "set", "immutable", "persistent", "functional"]
+license = "Apache-2.0 OR MIT"
+documentation = "https://docs.rs/imhm"
+repository = "https://github.com/estokes/imhm"
 
 [dependencies]
 anyhow = "1"
